@@ -75,7 +75,10 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 	int retval = 0;
 
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
+		return 0;
+
+	if (!fd_recv_ready(conn->t.sock.fd))
 		return 0;
 
 	errno = 0;
@@ -145,7 +148,7 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 #ifndef ASSUME_SPLICE_WORKS
 				if (splice_detects_close)
 #endif
-					__conn_data_poll_recv(conn); /* we know for sure that it's EAGAIN */
+					fd_cant_recv(conn->t.sock.fd); /* we know for sure that it's EAGAIN */
 				break;
 			}
 			else if (errno == ENOSYS || errno == EINVAL || errno == EBADF) {
@@ -173,6 +176,7 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 			 * being asked to poll.
 			 */
 			conn->flags |= CO_FL_WAIT_ROOM;
+			fd_done_recv(conn->t.sock.fd);
 			break;
 		}
 	} /* while */
@@ -193,7 +197,10 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
 {
 	int ret, done;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
+		return 0;
+
+	if (!fd_send_ready(conn->t.sock.fd))
 		return 0;
 
 	done = 0;
@@ -203,7 +210,7 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
 
 		if (ret <= 0) {
 			if (ret == 0 || errno == EAGAIN) {
-				__conn_data_poll_send(conn);
+				fd_cant_send(conn->t.sock.fd);
 				break;
 			}
 			else if (errno == EINTR)
@@ -226,8 +233,7 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
 
 
 /* Receive up to <count> bytes from connection <conn>'s socket and store them
- * into buffer <buf>. The caller must ensure that <count> is always smaller
- * than the buffer's size. Only one call to recv() is performed, unless the
+ * into buffer <buf>. Only one call to recv() is performed, unless the
  * buffer wraps, in which case a second call may be performed. The connection's
  * flags are updated with whatever special event is detected (error, read0,
  * empty). The caller is responsible for taking care of those events and
@@ -239,9 +245,12 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
 static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int count)
 {
 	int ret, done = 0;
-	int try = count;
+	int try;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
+		return 0;
+
+	if (!fd_recv_ready(conn->t.sock.fd))
 		return 0;
 
 	errno = 0;
@@ -258,24 +267,27 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		}
 	}
 
-	/* compute the maximum block size we can read at once. */
-	if (buffer_empty(buf)) {
-		/* let's realign the buffer to optimize I/O */
+	/* let's realign the buffer to optimize I/O */
+	if (buffer_empty(buf))
 		buf->p = buf->data;
-	}
-	else if (buf->data + buf->o < buf->p &&
-		 buf->p + buf->i < buf->data + buf->size) {
-		/* remaining space wraps at the end, with a moving limit */
-		if (try > buf->data + buf->size - (buf->p + buf->i))
-			try = buf->data + buf->size - (buf->p + buf->i);
-	}
 
 	/* read the largest possible block. For this, we perform only one call
 	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
 	 * in which case we accept to do it once again. A new attempt is made on
 	 * EINTR too.
 	 */
-	while (try) {
+	while (count > 0) {
+		/* first check if we have some room after p+i */
+		try = buf->data + buf->size - (buf->p + buf->i);
+		/* otherwise continue between data and p-o */
+		if (try <= 0) {
+			try = buf->p - (buf->data + buf->o);
+			if (try <= 0)
+				break;
+		}
+		if (try > count)
+			try = count;
+
 		ret = recv(conn->t.sock.fd, bi_end(buf), try, 0);
 
 		if (ret > 0) {
@@ -288,16 +300,17 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 				 */
 				if (fdtab[conn->t.sock.fd].ev & FD_POLL_HUP)
 					goto read0;
+
+				fd_done_recv(conn->t.sock.fd);
 				break;
 			}
 			count -= ret;
-			try = count;
 		}
 		else if (ret == 0) {
 			goto read0;
 		}
 		else if (errno == EAGAIN) {
-			__conn_data_poll_recv(conn);
+			fd_cant_recv(conn->t.sock.fd);
 			break;
 		}
 		else if (errno != EINTR) {
@@ -341,7 +354,10 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 {
 	int ret, try, done, send_flag;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
+		return 0;
+
+	if (!fd_send_ready(conn->t.sock.fd))
 		return 0;
 
 	done = 0;
@@ -357,7 +373,7 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 
 		send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
 		if (try < buf->o)
-			send_flag = MSG_MORE;
+			send_flag |= MSG_MORE;
 
 		ret = send(conn->t.sock.fd, bo_ptr(buf), try, send_flag | flags);
 
@@ -375,7 +391,7 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 		}
 		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN) {
 			/* nothing written, we need to poll for write first */
-			__conn_data_poll_send(conn);
+			fd_cant_send(conn->t.sock.fd);
 			break;
 		}
 		else if (errno != EINTR) {

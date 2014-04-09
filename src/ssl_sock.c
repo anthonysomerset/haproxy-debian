@@ -75,6 +75,7 @@
 #include <proto/task.h>
 
 #define SSL_SOCK_ST_FL_VERIFY_DONE  0x00000001
+#define SSL_SOCK_ST_FL_16K_WBFSIZE  0x00000002
 /* bits 0xFFFF0000 are reserved to store verify errors */
 
 /* Verify errors macros */
@@ -86,18 +87,43 @@
 #define SSL_SOCK_ST_TO_CAEDEPTH(s) ((s >> (6+16)) & 15)
 #define SSL_SOCK_ST_TO_CRTERROR(s) ((s >> (4+6+16)) & 63)
 
-static int sslconns = 0;
+/* server and bind verify method, it uses a global value as default */
+enum {
+	SSL_SOCK_VERIFY_DEFAULT  = 0,
+	SSL_SOCK_VERIFY_REQUIRED = 1,
+	SSL_SOCK_VERIFY_OPTIONAL = 2,
+	SSL_SOCK_VERIFY_NONE     = 3,
+};
+
+int sslconns = 0;
+int totalsslconns = 0;
 
 void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 {
 	struct connection *conn = (struct connection *)SSL_get_app_data(ssl);
 	(void)ret; /* shut gcc stupid warning */
+	BIO *write_bio;
 
 	if (where & SSL_CB_HANDSHAKE_START) {
 		/* Disable renegotiation (CVE-2009-3555) */
 		if (conn->flags & CO_FL_CONNECTED) {
 			conn->flags |= CO_FL_ERROR;
 			conn->err_code = CO_ER_SSL_RENEG;
+		}
+	}
+
+	if ((where & SSL_CB_ACCEPT_LOOP) == SSL_CB_ACCEPT_LOOP) {
+		if (!(conn->xprt_st & SSL_SOCK_ST_FL_16K_WBFSIZE)) {
+			/* Long certificate chains optimz
+			   If write and read bios are differents, we
+			   consider that the buffering was activated,
+                           so we rise the output buffer size from 4k
+			   to 16k */
+			write_bio = SSL_get_wbio(ssl);
+			if (write_bio != SSL_get_rbio(ssl)) {
+				BIO_set_write_buffer_size(write_bio, 16384);
+				conn->xprt_st |= SSL_SOCK_ST_FL_16K_WBFSIZE;
+			}
 		}
 	}
 }
@@ -650,6 +676,7 @@ int ssl_sock_load_cert_list_file(char *file, struct bind_conf *bind_conf, struct
 int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy *curproxy)
 {
 	int cfgerr = 0;
+	int verify = SSL_VERIFY_NONE;
 	int ssloptions =
 		SSL_OP_ALL | /* all known workarounds for bugs */
 		SSL_OP_NO_SSLv2 |
@@ -694,8 +721,19 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 
 	SSL_CTX_set_options(ctx, ssloptions);
 	SSL_CTX_set_mode(ctx, sslmode);
-	SSL_CTX_set_verify(ctx, bind_conf->verify ? bind_conf->verify : SSL_VERIFY_NONE, ssl_sock_bind_verifycbk);
-	if (bind_conf->verify & SSL_VERIFY_PEER) {
+	switch (bind_conf->verify) {
+		case SSL_SOCK_VERIFY_NONE:
+			verify = SSL_VERIFY_NONE;
+			break;
+		case SSL_SOCK_VERIFY_OPTIONAL:
+			verify = SSL_VERIFY_PEER;
+			break;
+		case SSL_SOCK_VERIFY_REQUIRED:
+			verify = SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+			break;
+	}
+	SSL_CTX_set_verify(ctx, verify, ssl_sock_bind_verifycbk);
+	if (verify & SSL_VERIFY_PEER) {
 		if (bind_conf->ca_file) {
 			/* load CAfile to verify */
 			if (!SSL_CTX_load_verify_locations(ctx, bind_conf->ca_file, NULL)) {
@@ -705,6 +743,11 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 			}
 			/* set CA names fo client cert request, function returns void */
 			SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(bind_conf->ca_file));
+		}
+		else {
+			Alert("Proxy '%s': verify is enabled but no CA file specified for bind '%s' at [%s:%d].\n",
+			      curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+			cfgerr++;
 		}
 #ifdef X509_V_FLAG_CRL_CHECK
 		if (bind_conf->crl_file) {
@@ -905,6 +948,7 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 		SSL_MODE_ENABLE_PARTIAL_WRITE |
 		SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
 		SSL_MODE_RELEASE_BUFFERS;
+	int verify = SSL_VERIFY_NONE;
 
 	/* Make sure openssl opens /dev/urandom before the chroot */
 	if (!ssl_initialize_random()) {
@@ -973,10 +1017,22 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 
 	SSL_CTX_set_options(srv->ssl_ctx.ctx, options);
 	SSL_CTX_set_mode(srv->ssl_ctx.ctx, mode);
+
+	if (global.ssl_server_verify == SSL_SERVER_VERIFY_REQUIRED)
+		verify = SSL_VERIFY_PEER;
+
+	switch (srv->ssl_ctx.verify) {
+		case SSL_SOCK_VERIFY_NONE:
+			verify = SSL_VERIFY_NONE;
+			break;
+		case SSL_SOCK_VERIFY_REQUIRED:
+			verify = SSL_VERIFY_PEER;
+			break;
+	}
 	SSL_CTX_set_verify(srv->ssl_ctx.ctx,
-	                   srv->ssl_ctx.verify ? srv->ssl_ctx.verify : SSL_VERIFY_NONE,
+	                   verify,
 	                   srv->ssl_ctx.verify_host ? ssl_sock_srv_verifycbk : NULL);
-	if (srv->ssl_ctx.verify & SSL_VERIFY_PEER) {
+	if (verify & SSL_VERIFY_PEER) {
 		if (srv->ssl_ctx.ca_file) {
 			/* load CAfile to verify */
 			if (!SSL_CTX_load_verify_locations(srv->ssl_ctx.ctx, srv->ssl_ctx.ca_file, NULL)) {
@@ -985,6 +1041,17 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 				      srv->conf.file, srv->conf.line, srv->ssl_ctx.ca_file);
 				cfgerr++;
 			}
+		}
+		else {
+			if (global.ssl_server_verify == SSL_SERVER_VERIFY_REQUIRED)
+				Alert("Proxy '%s', server '%s' |%s:%d] verify is enabled by default but no CA file specified. If you're running on a LAN where you're certain to trust the server's certificate, please set an explicit 'verify none' statement on the 'server' line, or use 'ssl-server-verify none' in the global section to disable server-side verifications by default.\n",
+				      curproxy->id, srv->id,
+				      srv->conf.file, srv->conf.line);
+			else
+				Alert("Proxy '%s', server '%s' |%s:%d] verify is enabled but no CA file specified.\n",
+				      curproxy->id, srv->id,
+				      srv->conf.file, srv->conf.line);
+			cfgerr++;
 		}
 #ifdef X509_V_FLAG_CRL_CHECK
 		if (srv->ssl_ctx.crl_file) {
@@ -1097,7 +1164,7 @@ static int ssl_sock_init(struct connection *conn)
 	if (conn->xprt_ctx)
 		return 0;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
 		return 0;
 
 	if (global.maxsslconn && sslconns >= global.maxsslconn) {
@@ -1129,6 +1196,7 @@ static int ssl_sock_init(struct connection *conn)
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
 		sslconns++;
+		totalsslconns++;
 		return 0;
 	}
 	else if (objt_listener(conn->target)) {
@@ -1151,6 +1219,7 @@ static int ssl_sock_init(struct connection *conn)
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
 		sslconns++;
+		totalsslconns++;
 		return 0;
 	}
 	/* don't know how to handle such a target */
@@ -1169,7 +1238,7 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 {
 	int ret;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
 		return 0;
 
 	if (!conn->xprt_ctx)
@@ -1191,7 +1260,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			if (ret == SSL_ERROR_WANT_WRITE) {
 				/* SSL handshake needs to write, L4 connection may not be ready */
 				__conn_sock_stop_recv(conn);
-				__conn_sock_poll_send(conn);
+				__conn_sock_want_send(conn);
+				fd_cant_send(conn->t.sock.fd);
 				return 0;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -1206,7 +1276,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				if (conn->flags & CO_FL_WAIT_L4_CONN)
 					conn->flags &= ~CO_FL_WAIT_L4_CONN;
 				__conn_sock_stop_send(conn);
-				__conn_sock_poll_recv(conn);
+				__conn_sock_want_recv(conn);
+				fd_cant_recv(conn->t.sock.fd);
 				return 0;
 			}
 			else if (ret == SSL_ERROR_SYSCALL) {
@@ -1231,8 +1302,7 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				 * TCP sockets. We first try to drain possibly pending
 				 * data to avoid this as much as possible.
 				 */
-				if ((conn->flags & CO_FL_CTRL_READY) && conn->ctrl && conn->ctrl->drain)
-					conn->ctrl->drain(conn->t.sock.fd);
+				conn_drain(conn);
 				if (!conn->err_code)
 					conn->err_code = CO_ER_SSL_HANDSHAKE;
 				goto out_error;
@@ -1250,7 +1320,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		if (ret == SSL_ERROR_WANT_WRITE) {
 			/* SSL handshake needs to write, L4 connection may not be ready */
 			__conn_sock_stop_recv(conn);
-			__conn_sock_poll_send(conn);
+			__conn_sock_want_send(conn);
+			fd_cant_send(conn->t.sock.fd);
 			return 0;
 		}
 		else if (ret == SSL_ERROR_WANT_READ) {
@@ -1258,7 +1329,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			if (conn->flags & CO_FL_WAIT_L4_CONN)
 				conn->flags &= ~CO_FL_WAIT_L4_CONN;
 			__conn_sock_stop_send(conn);
-			__conn_sock_poll_recv(conn);
+			__conn_sock_want_recv(conn);
+			fd_cant_recv(conn->t.sock.fd);
 			return 0;
 		}
 		else if (ret == SSL_ERROR_SYSCALL) {
@@ -1282,8 +1354,7 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			 * TCP sockets. We first try to drain possibly pending
 			 * data to avoid this as much as possible.
 			 */
-			if ((conn->flags & CO_FL_CTRL_READY) && conn->ctrl && conn->ctrl->drain)
-				conn->ctrl->drain(conn->t.sock.fd);
+			conn_drain(conn);
 			if (!conn->err_code)
 				conn->err_code = CO_ER_SSL_HANDSHAKE;
 			goto out_error;
@@ -1325,8 +1396,7 @@ reneg_ok:
 }
 
 /* Receive up to <count> bytes from connection <conn>'s socket and store them
- * into buffer <buf>. The caller must ensure that <count> is always smaller
- * than the buffer's size. Only one call to recv() is performed, unless the
+ * into buffer <buf>. Only one call to recv() is performed, unless the
  * buffer wraps, in which case a second call may be performed. The connection's
  * flags are updated with whatever special event is detected (error, read0,
  * empty). The caller is responsible for taking care of those events and
@@ -1336,7 +1406,7 @@ reneg_ok:
 static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int count)
 {
 	int ret, done = 0;
-	int try = count;
+	int try;
 
 	if (!conn->xprt_ctx)
 		goto out_error;
@@ -1345,24 +1415,27 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		/* a handshake was requested */
 		return 0;
 
-	/* compute the maximum block size we can read at once. */
-	if (buffer_empty(buf)) {
-		/* let's realign the buffer to optimize I/O */
+	/* let's realign the buffer to optimize I/O */
+	if (buffer_empty(buf))
 		buf->p = buf->data;
-	}
-	else if (buf->data + buf->o < buf->p &&
-		 buf->p + buf->i < buf->data + buf->size) {
-		/* remaining space wraps at the end, with a moving limit */
-		if (try > buf->data + buf->size - (buf->p + buf->i))
-			try = buf->data + buf->size - (buf->p + buf->i);
-	}
 
 	/* read the largest possible block. For this, we perform only one call
 	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
 	 * in which case we accept to do it once again. A new attempt is made on
 	 * EINTR too.
 	 */
-	while (try) {
+	while (count > 0) {
+		/* first check if we have some room after p+i */
+		try = buf->data + buf->size - (buf->p + buf->i);
+		/* otherwise continue between data and p-o */
+		if (try <= 0) {
+			try = buf->p - (buf->data + buf->o);
+			if (try <= 0)
+				break;
+		}
+		if (try > count)
+			try = count;
+
 		ret = SSL_read(conn->xprt_ctx, bi_end(buf), try);
 		if (conn->flags & CO_FL_ERROR) {
 			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
@@ -1374,7 +1447,6 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 			if (ret < try)
 				break;
 			count -= ret;
-			try = count;
 		}
 		else if (ret == 0) {
 			ret =  SSL_get_error(conn->xprt_ctx, ret);
@@ -1405,7 +1477,7 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 					break;
 				}
 				/* we need to poll for retry a read later */
-				__conn_data_poll_recv(conn);
+				fd_cant_recv(conn->t.sock.fd);
 				break;
 			}
 			/* otherwise it's a real error */
@@ -1486,7 +1558,7 @@ static int ssl_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 					break;
 				}
 				/* we need to poll to retry a write later */
-				__conn_data_poll_send(conn);
+				fd_cant_send(conn->t.sock.fd);
 				break;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -3184,11 +3256,11 @@ static int bind_parse_verify(char **args, int cur_arg, struct proxy *px, struct 
 	}
 
 	if (strcmp(args[cur_arg + 1], "none") == 0)
-		conf->verify = SSL_VERIFY_NONE;
+		conf->verify = SSL_SOCK_VERIFY_NONE;
 	else if (strcmp(args[cur_arg + 1], "optional") == 0)
-		conf->verify = SSL_VERIFY_PEER;
+		conf->verify = SSL_SOCK_VERIFY_OPTIONAL;
 	else if (strcmp(args[cur_arg + 1], "required") == 0)
-		conf->verify = SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+		conf->verify = SSL_SOCK_VERIFY_REQUIRED;
 	else {
 		if (err)
 			memprintf(err, "'%s' : unknown verify method '%s', only 'none', 'optional', and 'required' are supported\n",
@@ -3374,9 +3446,9 @@ static int srv_parse_verify(char **args, int *cur_arg, struct proxy *px, struct 
 	}
 
 	if (strcmp(args[*cur_arg + 1], "none") == 0)
-		newsrv->ssl_ctx.verify = SSL_VERIFY_NONE;
+		newsrv->ssl_ctx.verify = SSL_SOCK_VERIFY_NONE;
 	else if (strcmp(args[*cur_arg + 1], "required") == 0)
-		newsrv->ssl_ctx.verify = SSL_VERIFY_PEER;
+		newsrv->ssl_ctx.verify = SSL_SOCK_VERIFY_REQUIRED;
 	else {
 		if (err)
 			memprintf(err, "'%s' : unknown verify method '%s', only 'none' and 'required' are supported\n",

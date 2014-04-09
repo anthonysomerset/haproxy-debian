@@ -69,13 +69,13 @@
 
 /* indicate how we *want* the connection to behave, regardless of what is in
  * the headers. We have 4 possible values right now :
- * - WANT_TUN : will be a tunnel (default when nothing configured or with CONNECT).
- * - WANT_KAL : try to maintain keep-alive
+ * - WANT_KAL : try to maintain keep-alive (default hwen nothing configured)
+ * - WANT_TUN : will be a tunnel (CONNECT).
  * - WANT_SCL : enforce close on the server side
  * - WANT_CLO : enforce close on both sides
  */
-#define TX_CON_WANT_TUN 0x00000000	/* note: it's important that it is 0 (init) */
-#define TX_CON_WANT_KAL 0x00100000
+#define TX_CON_WANT_KAL 0x00000000	/* note: it's important that it is 0 (init) */
+#define TX_CON_WANT_TUN 0x00100000
 #define TX_CON_WANT_SCL 0x00200000
 #define TX_CON_WANT_CLO 0x00300000
 #define TX_CON_WANT_MSK 0x00300000	/* this is the mask to get the bits */
@@ -83,7 +83,7 @@
 #define TX_CON_CLO_SET  0x00400000	/* "connection: close" is now set */
 #define TX_CON_KAL_SET  0x00800000	/* "connection: keep-alive" is now set */
 
-/* Unused: 0x1000000 */
+#define TX_PREFER_LAST  0x01000000      /* try to stay on same server if possible (eg: after 401) */
 
 #define TX_HDR_CONN_UPG 0x02000000	/* The "Upgrade" token was found in the "Connection" header */
 #define TX_WAIT_NEXT_RQ	0x04000000	/* waiting for the second request to start, use keep-alive timeout */

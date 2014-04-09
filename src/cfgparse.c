@@ -129,11 +129,7 @@ static const struct cfg_opt cfg_opts[] =
 	{ "clitcpka",     PR_O_TCP_CLI_KA, PR_CAP_FE, 0, 0 },
 	{ "contstats",    PR_O_CONTSTATS,  PR_CAP_FE, 0, 0 },
 	{ "dontlognull",  PR_O_NULLNOLOG,  PR_CAP_FE, 0, 0 },
-	{ "forceclose",   PR_O_FORCE_CLO,  PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "http_proxy",	  PR_O_HTTP_PROXY, PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
-	{ "httpclose",    PR_O_HTTP_CLOSE, PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
-	{ "http-keep-alive",   PR_O_KEEPALIVE,   PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
-	{ "http-server-close", PR_O_SERVER_CLO,  PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "prefer-last-server", PR_O_PREF_LAST,  PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "logasap",      PR_O_LOGASAP,    PR_CAP_FE, 0, 0 },
 	{ "nolinger",     PR_O_TCP_NOLING, PR_CAP_FE | PR_CAP_BE, 0, 0 },
@@ -862,6 +858,22 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		goto out;
 #endif
 	}
+	else if (!strcmp(args[0], "ssl-server-verify")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (strcmp(args[1],"none") == 0)
+			global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
+		else if (strcmp(args[1],"required") == 0)
+			global.ssl_server_verify = SSL_SERVER_VERIFY_REQUIRED;
+		else {
+			Alert("parsing [%s:%d] : '%s' expects 'none' or 'required' as argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+	                goto out;
+		}
+	}
 	else if (!strcmp(args[0], "maxconnrate")) {
 		if (global.cps_lim != 0) {
 			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
@@ -874,6 +886,32 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.cps_lim = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "maxsessrate")) {
+		if (global.sps_lim != 0) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.sps_lim = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "maxsslrate")) {
+		if (global.ssl_lim != 0) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.ssl_lim = atol(args[1]);
 	}
 	else if (!strcmp(args[0], "maxcomprate")) {
 		if (*(args[1]) == 0) {
@@ -3463,6 +3501,72 @@ stats_error_parsing:
 			}
 		}
 
+		/* HTTP options override each other. They can be cancelled using
+		 * "no option xxx" which only switches to default mode if the mode
+		 * was this one (useful for cancelling options set in defaults
+		 * sections).
+		 */
+		if (strcmp(args[1], "httpclose") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_PCL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "forceclose") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_FCL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "http-server-close") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_SCL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "http-keep-alive") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_KAL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_KAL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "http-tunnel") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_TUN;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+
 		if (kwm != KWM_STD) {
 			Alert("parsing [%s:%d]: negation/default is not supported for option '%s'.\n",
 				file, linenum, args[1]);
@@ -3985,7 +4089,70 @@ stats_error_parsing:
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
-		if (strcmp(args[1], "send") == 0) {
+		if (strcmp(args[1], "connect") == 0) {
+			const char *ptr_arg;
+			int cur_arg;
+			struct tcpcheck_rule *tcpcheck;
+			struct list *l;
+
+			/* check if first rule is also a 'connect' action */
+			l = (struct list *)&curproxy->tcpcheck_rules;
+			if (l->p != l->n) {
+				tcpcheck = (struct tcpcheck_rule *)l->n;
+				if (tcpcheck && tcpcheck->action != TCPCHK_ACT_CONNECT) {
+					Alert("parsing [%s:%d] : first step MUST also be a 'connect' when there is a 'connect' step in the tcp-check ruleset.\n",
+					      file, linenum);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+
+			cur_arg = 2;
+			tcpcheck = (struct tcpcheck_rule *)calloc(1, sizeof(*tcpcheck));
+			tcpcheck->action = TCPCHK_ACT_CONNECT;
+
+			/* parsing each parameters to fill up the rule */
+			while (*(ptr_arg = args[cur_arg])) {
+				/* tcp port */
+				if (strcmp(args[cur_arg], "port") == 0) {
+					if ( (atol(args[cur_arg + 1]) > 65535) ||
+							(atol(args[cur_arg + 1]) < 1) ){
+						Alert("parsing [%s:%d] : '%s %s %s' expects a valid TCP port (from range 1 to 65535), got %s.\n",
+						      file, linenum, args[0], args[1], "port", args[cur_arg + 1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->port = atol(args[cur_arg + 1]);
+					cur_arg += 2;
+				}
+				/* send proxy protocol */
+				else if (strcmp(args[cur_arg], "send-proxy") == 0) {
+					tcpcheck->conn_opts |= TCPCHK_OPT_SEND_PROXY;
+					cur_arg++;
+				}
+#ifdef USE_OPENSSL
+				else if (strcmp(args[cur_arg], "ssl") == 0) {
+					curproxy->options |= PR_O_TCPCHK_SSL;
+					tcpcheck->conn_opts |= TCPCHK_OPT_SSL;
+					cur_arg++;
+				}
+#endif /* USE_OPENSSL */
+				else {
+#ifdef USE_OPENSSL
+					Alert("parsing [%s:%d] : '%s %s' expects 'port', 'send-proxy' or 'ssl' but got '%s' as argument.\n",
+#else /* USE_OPENSSL */
+					Alert("parsing [%s:%d] : '%s %s' expects 'port', 'send-proxy' or but got '%s' as argument.\n",
+#endif /* USE_OPENSSL */
+					      file, linenum, args[0], args[1], args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+			}
+
+			LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
+		}
+		else if (strcmp(args[1], "send") == 0) {
 			if (! *(args[2]) ) {
 				/* SEND string expected */
 				Alert("parsing [%s:%d] : '%s %s %s' expects <STRING> as argument.\n",
@@ -4131,7 +4298,7 @@ stats_error_parsing:
 			}
 		}
 		else {
-			Alert("parsing [%s:%d] : '%s' only supports 'send' or 'expect'.\n", file, linenum, args[0]);
+			Alert("parsing [%s:%d] : '%s' only supports 'connect', 'send' or 'expect'.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -5087,7 +5254,7 @@ stats_error_parsing:
 			 */
 			if (!newsrv->check.port && !is_addr(&newsrv->check_common.addr)) {
 #ifdef USE_OPENSSL
-				newsrv->check.use_ssl |= newsrv->use_ssl;
+				newsrv->check.use_ssl |= (newsrv->use_ssl || (newsrv->proxy->options & PR_O_TCPCHK_SSL));
 #endif
 				newsrv->check.send_proxy |= (newsrv->state & SRV_SEND_PROXY);
 			}
@@ -5111,11 +5278,40 @@ stats_error_parsing:
 						break;
 				}
 			}
+			/*
+			 * We need at least a service port, a check port or the first tcp-check rule must
+			 * be a 'connect' one
+			 */
 			if (!newsrv->check.port) {
-				Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
-				      file, linenum, newsrv->id);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
+				struct tcpcheck_rule *n = NULL, *r = NULL;
+				struct list *l;
+
+				r = (struct tcpcheck_rule *)newsrv->proxy->tcpcheck_rules.n;
+				if (!r) {
+					Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
+					      file, linenum, newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				if ((r->action != TCPCHK_ACT_CONNECT) || !r->port) {
+					Alert("parsing [%s:%d] : server %s has neither service port nor check port nor tcp_check rule 'connect' with port information. Check has been disabled.\n",
+					      file, linenum, newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else {
+					/* scan the tcp-check ruleset to ensure a port has been configured */
+					l = &newsrv->proxy->tcpcheck_rules;
+					list_for_each_entry(n, l, list) {
+						r = (struct tcpcheck_rule *)n->list.p;
+						if ((r->action == TCPCHK_ACT_CONNECT) && (!r->port)) {
+							Alert("parsing [%s:%d] : server %s has neither service port nor check port, and a tcp_check rule 'connect' with no port information. Check has been disabled.\n",
+							      file, linenum, newsrv->id);
+							err_code |= ERR_ALERT | ERR_FATAL;
+							goto out;
+						}
+					}
+				}
 			}
 
 			/* note: check type will be set during the config review phase */
@@ -6935,6 +7131,30 @@ out_uri_auth_compat:
 			if (!next)
 				break;
 			curproxy->srv = next;
+		}
+
+		/* Check that no server name conflicts. This causes trouble in the stats.
+		 * We only emit a warning for the first conflict affecting each server,
+		 * in order to avoid combinatory explosion if all servers have the same
+		 * name. We do that only for servers which do not have an explicit ID,
+		 * because these IDs were made also for distinguishing them and we don't
+		 * want to annoy people who correctly manage them.
+		 */
+		for (newsrv = curproxy->srv; newsrv; newsrv = newsrv->next) {
+			struct server *other_srv;
+
+			if (newsrv->puid)
+				continue;
+
+			for (other_srv = curproxy->srv; other_srv && other_srv != newsrv; other_srv = other_srv->next) {
+				if (!other_srv->puid && strcmp(other_srv->id, newsrv->id) == 0) {
+					Warning("parsing [%s:%d] : %s '%s', another server named '%s' was defined without an explicit ID at line %d, this is not recommended.\n",
+						newsrv->conf.file, newsrv->conf.line,
+						proxy_type_str(curproxy), curproxy->id,
+						newsrv->id, other_srv->conf.line);
+					break;
+				}
+			}
 		}
 
 		/* assign automatic UIDs to servers which don't have one yet */
