@@ -54,7 +54,6 @@
 #include <proto/lb_map.h>
 #include <proto/listener.h>
 #include <proto/log.h>
-#include <proto/port_range.h>
 #include <proto/protocol.h>
 #include <proto/proto_tcp.h>
 #include <proto/proto_uxst.h>
@@ -111,6 +110,18 @@ enum kw_mod {
 	KWM_DEF,      /* "default" prefixed before the keyword */
 };
 
+/* permit to store configuration section */
+struct cfg_section {
+	struct list list;
+	char *section_name;
+	int (*section_parser)(const char *, int, char **, int);
+};
+
+/* Used to chain configuration sections definitions. This list
+ * stores struct cfg_section
+ */
+struct list sections = LIST_HEAD_INIT(sections);
+
 /* some of the most common options which are also the easiest to handle */
 struct cfg_opt {
 	const char *name;
@@ -129,11 +140,7 @@ static const struct cfg_opt cfg_opts[] =
 	{ "clitcpka",     PR_O_TCP_CLI_KA, PR_CAP_FE, 0, 0 },
 	{ "contstats",    PR_O_CONTSTATS,  PR_CAP_FE, 0, 0 },
 	{ "dontlognull",  PR_O_NULLNOLOG,  PR_CAP_FE, 0, 0 },
-	{ "forceclose",   PR_O_FORCE_CLO,  PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "http_proxy",	  PR_O_HTTP_PROXY, PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
-	{ "httpclose",    PR_O_HTTP_CLOSE, PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
-	{ "http-keep-alive",   PR_O_KEEPALIVE,   PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
-	{ "http-server-close", PR_O_SERVER_CLO,  PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "prefer-last-server", PR_O_PREF_LAST,  PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "logasap",      PR_O_LOGASAP,    PR_CAP_FE, 0, 0 },
 	{ "nolinger",     PR_O_TCP_NOLING, PR_CAP_FE | PR_CAP_BE, 0, 0 },
@@ -300,32 +307,6 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 	return 0;
 }
 
-/*
- * Sends a warning if proxy <proxy> does not have at least one of the
- * capabilities in <cap>. An optionnal <hint> may be added at the end
- * of the warning to help the user. Returns 1 if a warning was emitted
- * or 0 if the condition is valid.
- */
-int warnifnotcap(struct proxy *proxy, int cap, const char *file, int line, const char *arg, const char *hint)
-{
-	char *msg;
-
-	switch (cap) {
-	case PR_CAP_BE: msg = "no backend"; break;
-	case PR_CAP_FE: msg = "no frontend"; break;
-	case PR_CAP_RS: msg = "no ruleset"; break;
-	case PR_CAP_BE|PR_CAP_FE: msg = "neither frontend nor backend"; break;
-	default: msg = "not enough"; break;
-	}
-
-	if (!(proxy->cap & cap)) {
-		Warning("parsing [%s:%d] : '%s' ignored because %s '%s' has %s capability.%s\n",
-			file, line, arg, proxy_type_str(proxy), proxy->id, msg, hint ? hint : "");
-		return 1;
-	}
-	return 0;
-}
-
 /* Report a warning if a rule is placed after a 'block' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
@@ -333,6 +314,19 @@ int warnif_rule_after_block(struct proxy *proxy, const char *file, int line, con
 {
 	if (!LIST_ISEMPTY(&proxy->block_cond)) {
 		Warning("parsing [%s:%d] : a '%s' rule placed after a 'block' rule will still be processed before.\n",
+			file, line, arg);
+		return 1;
+	}
+	return 0;
+}
+
+/* Report a warning if a rule is placed after an 'http_request' rule.
+ * Return 1 if the warning has been emitted, otherwise 0.
+ */
+int warnif_rule_after_http_req(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	if (!LIST_ISEMPTY(&proxy->http_req_rules)) {
+		Warning("parsing [%s:%d] : a '%s' rule placed after an 'http-request' rule will still be processed before.\n",
 			file, line, arg);
 		return 1;
 	}
@@ -391,13 +385,38 @@ int warnif_rule_after_use_backend(struct proxy *proxy, const char *file, int lin
 	return 0;
 }
 
+/* Report a warning if a rule is placed after a 'use-server' rule.
+ * Return 1 if the warning has been emitted, otherwise 0.
+ */
+int warnif_rule_after_use_server(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	if (!LIST_ISEMPTY(&proxy->server_rules)) {
+		Warning("parsing [%s:%d] : a '%s' rule placed after a 'use-server' rule will still be processed before.\n",
+			file, line, arg);
+		return 1;
+	}
+	return 0;
+}
+
 /* report a warning if a block rule is dangerously placed */
 int warnif_misplaced_block(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	return	warnif_rule_after_http_req(proxy, file, line, arg) ||
+		warnif_rule_after_reqxxx(proxy, file, line, arg) ||
+		warnif_rule_after_reqadd(proxy, file, line, arg) ||
+		warnif_rule_after_redirect(proxy, file, line, arg) ||
+		warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
+}
+
+/* report a warning if an http-request rule is dangerously placed */
+int warnif_misplaced_http_req(struct proxy *proxy, const char *file, int line, const char *arg)
 {
 	return	warnif_rule_after_reqxxx(proxy, file, line, arg) ||
 		warnif_rule_after_reqadd(proxy, file, line, arg) ||
 		warnif_rule_after_redirect(proxy, file, line, arg) ||
-		warnif_rule_after_use_backend(proxy, file, line, arg);
+		warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
 }
 
 /* report a warning if a reqxxx rule is dangerously placed */
@@ -405,14 +424,23 @@ int warnif_misplaced_reqxxx(struct proxy *proxy, const char *file, int line, con
 {
 	return	warnif_rule_after_reqadd(proxy, file, line, arg) ||
 		warnif_rule_after_redirect(proxy, file, line, arg) ||
-		warnif_rule_after_use_backend(proxy, file, line, arg);
+		warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
 }
 
 /* report a warning if a reqadd rule is dangerously placed */
 int warnif_misplaced_reqadd(struct proxy *proxy, const char *file, int line, const char *arg)
 {
 	return	warnif_rule_after_redirect(proxy, file, line, arg) ||
-		warnif_rule_after_use_backend(proxy, file, line, arg);
+		warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
+}
+
+/* report a warning if a redirect rule is dangerously placed */
+int warnif_misplaced_redirect(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	return	warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
 }
 
 /* Report it if a request ACL condition uses some keywords that are incompatible
@@ -525,6 +553,9 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	else if (!strcmp(args[0], "nosplice")) {
 		global.tune.options &= ~GTUNE_USE_SPLICE;
 	}
+	else if (!strcmp(args[0], "nogetaddrinfo")) {
+		global.tune.options &= ~GTUNE_USE_GAI;
+	}
 	else if (!strcmp(args[0], "quiet")) {
 		global.mode |= MODE_QUIET;
 	}
@@ -621,6 +652,31 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		global.tune.maxrewrite = atol(args[1]);
 		if (global.tune.maxrewrite >= global.tune.bufsize / 2)
 			global.tune.maxrewrite = global.tune.bufsize / 2;
+	}
+	else if (!strcmp(args[0], "tune.idletimer")) {
+		unsigned int idle;
+		const char *res;
+
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a timer value between 0 and 65535 ms.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		res = parse_time_err(args[1], &idle, TIME_UNIT_MS);
+		if (res) {
+			Alert("parsing [%s:%d]: unexpected character '%c' in argument to <%s>.\n",
+			      file, linenum, *res, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (idle > 65535) {
+			Alert("parsing [%s:%d] : '%s' expects a timer value between 0 and 65535 ms.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.tune.idle_timer = idle;
 	}
 	else if (!strcmp(args[0], "tune.rcvbuf.client")) {
 		if (global.tune.client_rcvbuf != 0) {
@@ -862,6 +918,52 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		goto out;
 #endif
 	}
+	else if (!strcmp(args[0], "ssl-default-bind-ciphers")) {
+#ifdef USE_OPENSSL
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a cipher suite as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		free(global.listen_default_ciphers);
+		global.listen_default_ciphers = strdup(args[1]);
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "ssl-default-server-ciphers")) {
+#ifdef USE_OPENSSL
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a cipher suite as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		free(global.connect_default_ciphers);
+		global.connect_default_ciphers = strdup(args[1]);
+#else
+		Alert("parsing [%s:%d] : '%s' is not implemented.\n", file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (!strcmp(args[0], "ssl-server-verify")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (strcmp(args[1],"none") == 0)
+			global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
+		else if (strcmp(args[1],"required") == 0)
+			global.ssl_server_verify = SSL_SERVER_VERIFY_REQUIRED;
+		else {
+			Alert("parsing [%s:%d] : '%s' expects 'none' or 'required' as argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+	                goto out;
+		}
+	}
 	else if (!strcmp(args[0], "maxconnrate")) {
 		if (global.cps_lim != 0) {
 			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
@@ -874,6 +976,32 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.cps_lim = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "maxsessrate")) {
+		if (global.sps_lim != 0) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.sps_lim = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "maxsslrate")) {
+		if (global.ssl_lim != 0) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.ssl_lim = atol(args[1]);
 	}
 	else if (!strcmp(args[0], "maxcomprate")) {
 		if (*(args[1]) == 0) {
@@ -955,17 +1083,17 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		for(i=1; *args[i]; i++)
-			len += strlen(args[i])+1;
+		for (i = 1; *args[i]; i++)
+			len += strlen(args[i]) + 1;
 
 		if (global.desc)
 			free(global.desc);
 
 		global.desc = d = (char *)calloc(1, len);
 
-		d += sprintf(d, "%s", args[1]);
-		for(i=2; *args[i]; i++)
-			d += sprintf(d, " %s", args[i]);
+		d += snprintf(d, global.desc + len - d, "%s", args[1]);
+		for (i = 2; *args[i]; i++)
+			d += snprintf(d, global.desc + len - d, " %s", args[i]);
 	}
 	else if (!strcmp(args[0], "node")) {
 		int i;
@@ -1213,6 +1341,28 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+	else if (!strcmp(args[0], "max-spread-checks")) {  /* maximum time between first and last check */
+		const char *err;
+		unsigned int val;
+
+
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d]: '%s' expects an integer argument (0..50).\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		err = parse_time_err(args[1], &val, TIME_UNIT_MS);
+		if (err) {
+			Alert("parsing [%s:%d]: unsupported character '%c' in '%s' (wants an integer delay).\n", file, linenum, *err, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+		global.max_spread_checks = val;
+		if (global.max_spread_checks < 0) {
+			Alert("parsing [%s:%d]: '%s' needs a positive delay in milliseconds.\n",file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+	}
 	else if (strcmp(args[0], "cpu-map") == 0) {  /* map a process list to a CPU set */
 #ifdef USE_CPU_AFFINITY
 		int cur_arg, i;
@@ -1450,7 +1600,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	if (strcmp(args[0], "peers") == 0) { /* new peers section */
 		if (!*args[1]) {
 			Alert("parsing [%s:%d] : missing name for peers section.\n", file, linenum);
-			err_code |= ERR_ALERT | ERR_FATAL;
+			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
 
@@ -1458,7 +1608,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		if (err) {
 			Alert("parsing [%s:%d] : character '%c' is not permitted in '%s' name '%s'.\n",
 			      file, linenum, *err, args[0], args[1]);
-			err_code |= ERR_ALERT | ERR_FATAL;
+			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
 
@@ -1628,39 +1778,9 @@ out:
 	return err_code;
 }
 
-static int init_check(struct check *check, int type, const char * file, int linenum)
-{
-	check->type = type;
-
-	/* Allocate buffer for requests... */
-	if ((check->bi = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
-		Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
-		return ERR_ALERT | ERR_ABORT;
-	}
-	check->bi->size = global.tune.chksize;
-
-	/* Allocate buffer for responses... */
-	if ((check->bo = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
-		Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
-		return ERR_ALERT | ERR_ABORT;
-	}
-	check->bo->size = global.tune.chksize;
-
-	/* Allocate buffer for partial results... */
-	if ((check->conn = calloc(1, sizeof(struct connection))) == NULL) {
-		Alert("parsing [%s:%d] : out of memory while allocating check connection.\n", file, linenum);
-		return ERR_ALERT | ERR_ABORT;
-	}
-
-	check->conn->t.sock.fd = -1; /* no agent in progress yet */
-
-	return 0;
-}
-
 int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 {
 	static struct proxy *curproxy = NULL;
-	struct server *newsrv = NULL;
 	const char *err;
 	int rc;
 	unsigned val;
@@ -1682,6 +1802,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		rc = PR_CAP_NONE;
 
 	if (rc != PR_CAP_NONE) {  /* new proxy */
+		struct ebpt_node *node;
+
 		if (!*args[1]) {
 			Alert("parsing [%s:%d] : '%s' expects an <id> argument and\n"
 			      "  optionnally supports [addr1]:port1[-end1]{,[addr]:port[-end]}...\n",
@@ -1697,7 +1819,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 
-		for (curproxy = proxy; curproxy != NULL; curproxy = curproxy->next) {
+		for (node = ebis_lookup(&proxy_by_name, args[1]); node; node = ebpt_next(node)) {
+			curproxy = container_of(node, struct proxy, conf.by_name);
+
+			if (strcmp(curproxy->id, args[1]) != 0)
+				break;
+
 			/*
 			 * If there are two proxies with the same name only following
 			 * combinations are allowed:
@@ -1709,9 +1836,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			 *	ruleset            -      -       -        -
 			 */
 
-			if (!strcmp(curproxy->id, args[1]) &&
-				(rc!=(PR_CAP_FE|PR_CAP_RS) || curproxy->cap!=(PR_CAP_BE|PR_CAP_RS)) &&
-				(rc!=(PR_CAP_BE|PR_CAP_RS) || curproxy->cap!=(PR_CAP_FE|PR_CAP_RS))) {
+			if ((rc != (PR_CAP_FE|PR_CAP_RS) || curproxy->cap != (PR_CAP_BE|PR_CAP_RS)) &&
+			    (rc != (PR_CAP_BE|PR_CAP_RS) || curproxy->cap != (PR_CAP_FE|PR_CAP_RS))) {
 				Warning("Parsing [%s:%d]: %s '%s' has same name as another %s (declared at %s:%d).\n",
 					file, linenum, proxy_cap_str(rc), args[1], proxy_type_str(curproxy),
 					curproxy->conf.file, curproxy->conf.line);
@@ -1733,6 +1859,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		curproxy->last_change = now.tv_sec;
 		curproxy->id = strdup(args[1]);
 		curproxy->cap = rc;
+		proxy_store_name(curproxy);
 
 		/* parse the listener address if any */
 		if ((curproxy->cap & PR_CAP_FE) && *args[2]) {
@@ -1803,6 +1930,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		if (curproxy->cap & PR_CAP_BE) {
 			curproxy->fullconn = defproxy.fullconn;
 			curproxy->conn_retries = defproxy.conn_retries;
+			curproxy->max_ka_queue = defproxy.max_ka_queue;
 
 			if (defproxy.check_req) {
 				curproxy->check_req = calloc(1, defproxy.check_len);
@@ -1866,7 +1994,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->timeout.tarpit = defproxy.timeout.tarpit;
 			curproxy->timeout.httpreq = defproxy.timeout.httpreq;
 			curproxy->timeout.httpka = defproxy.timeout.httpka;
-			curproxy->uri_auth  = defproxy.uri_auth;
 			curproxy->mon_net = defproxy.mon_net;
 			curproxy->mon_mask = defproxy.mon_mask;
 			if (defproxy.monitor_uri)
@@ -1902,6 +2029,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		curproxy->mode = defproxy.mode;
+		curproxy->uri_auth = defproxy.uri_auth; /* for stats */
 
 		/* copy default logsrvs to curproxy */
 		list_for_each_entry(tmplogsrv, &defproxy.logsrvs, list) {
@@ -1992,7 +2120,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	curproxy->conf.args.line = linenum;
 
 	/* Now let's parse the proxy-specific keywords */
-	if (!strcmp(args[0], "bind")) {  /* new listen addresses */
+	if (!strcmp(args[0], "server") || !strcmp(args[0], "default-server")) {
+		err_code |= parse_server(file, linenum, args, curproxy, &defproxy);
+		if (err_code & ERR_FATAL)
+			goto out;
+	}
+	else if (!strcmp(args[0], "bind")) {  /* new listen addresses */
 		struct listener *l;
 		int cur_arg;
 
@@ -2098,7 +2231,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		goto out;
 	}
 	else if (!strcmp(args[0], "monitor-net")) {  /* set the range of IPs to ignore */
-		if (!*args[1] || !str2net(args[1], &curproxy->mon_net, &curproxy->mon_mask)) {
+		if (!*args[1] || !str2net(args[1], 1, &curproxy->mon_net, &curproxy->mon_mask)) {
 			Alert("parsing [%s:%d] : '%s' expects address[/mask].\n",
 			      file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2195,15 +2328,15 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			return -1;
 		}
 
-		for(i=1; *args[i]; i++)
-			len += strlen(args[i])+1;
+		for (i = 1; *args[i]; i++)
+			len += strlen(args[i]) + 1;
 
 		d = (char *)calloc(1, len);
 		curproxy->desc = d;
 
-		d += sprintf(d, "%s", args[1]);
-		for(i=2; *args[i]; i++)
-			d += sprintf(d, " %s", args[i]);
+		d += snprintf(d, curproxy->desc + len - d, "%s", args[1]);
+		for (i = 2; *args[i]; i++)
+			d += snprintf(d, curproxy->desc + len - d, " %s", args[i]);
 
 	}
 	else if (!strcmp(args[0], "disabled")) {  /* disables this proxy */
@@ -2281,7 +2414,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 
-		if (parse_acl((const char **)args + 1, &curproxy->acl, &errmsg, &curproxy->conf.args) == NULL) {
+		if (parse_acl((const char **)args + 1, &curproxy->acl, &errmsg, &curproxy->conf.args, file, linenum) == NULL) {
 			Alert("parsing [%s:%d] : error detected while parsing ACL '%s' : %s.\n",
 			      file, linenum, args[1], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2685,6 +2818,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		err_code |= warnif_misplaced_http_req(curproxy, file, linenum, args[0]);
 		err_code |= warnif_cond_conflicts(rule->cond,
 	                                          (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
 	                                          file, linenum);
@@ -2780,7 +2914,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		LIST_ADDQ(&curproxy->redirect_rules, &rule->list);
-		err_code |= warnif_rule_after_use_backend(curproxy, file, linenum, args[0]);
+		err_code |= warnif_misplaced_redirect(curproxy, file, linenum, args[0]);
 		err_code |= warnif_cond_conflicts(rule->cond,
 	                                          (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
 	                                          file, linenum);
@@ -2803,21 +2937,16 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (strcmp(args[2], "if") != 0 && strcmp(args[2], "unless") != 0) {
-			Alert("parsing [%s:%d] : '%s' requires either 'if' or 'unless' followed by a condition.\n",
-			      file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
+		if (strcmp(args[2], "if") == 0 || strcmp(args[2], "unless") == 0) {
+			if ((cond = build_acl_cond(file, linenum, curproxy, (const char **)args + 2, &errmsg)) == NULL) {
+				Alert("parsing [%s:%d] : error detected while parsing switching rule : %s.\n",
+				      file, linenum, errmsg);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
 
-		if ((cond = build_acl_cond(file, linenum, curproxy, (const char **)args + 2, &errmsg)) == NULL) {
-			Alert("parsing [%s:%d] : error detected while parsing switching rule : %s.\n",
-			      file, linenum, errmsg);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
+			err_code |= warnif_cond_conflicts(cond, SMP_VAL_FE_SET_BCK, file, linenum);
 		}
-
-		err_code |= warnif_cond_conflicts(cond, SMP_VAL_FE_SET_BCK, file, linenum);
 
 		rule = (struct switching_rule *)calloc(1, sizeof(*rule));
 		rule->cond = cond;
@@ -2935,10 +3064,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			else if (strcmp(args[myidx], "peers") == 0) {
 				myidx++;
 				if (!*(args[myidx])) {
-				        Alert("parsing [%s:%d] : stick-table: missing argument after '%s'.\n",
-				              file, linenum, args[myidx-1]);
-				        err_code |= ERR_ALERT | ERR_FATAL;
-				        goto out;
+					Alert("parsing [%s:%d] : stick-table: missing argument after '%s'.\n",
+					      file, linenum, args[myidx-1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
 				}
 				curproxy->table.peers.name = strdup(args[myidx++]);
 			}
@@ -3112,7 +3241,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		curproxy->conf.args.ctx = ARGC_STK;
-		expr = sample_parse_expr(args, &myidx, &errmsg, &curproxy->conf.args);
+		expr = sample_parse_expr(args, &myidx, file, linenum, &errmsg, &curproxy->conf.args);
 		if (!expr) {
 			Alert("parsing [%s:%d] : '%s': %s\n", file, linenum, args[0], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -3178,9 +3307,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			LIST_ADDQ(&curproxy->sticking_rules, &rule->list);
 	}
 	else if (!strcmp(args[0], "stats")) {
-		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
-			err_code |= ERR_WARN;
-
 		if (curproxy != &defproxy && curproxy->uri_auth == defproxy.uri_auth)
 			curproxy->uri_auth = NULL; /* we must detach from the default config */
 
@@ -3362,14 +3488,14 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				int i, len=0;
 				char *d;
 
-				for(i=2; *args[i]; i++)
-					len += strlen(args[i])+1;
+				for (i = 2; *args[i]; i++)
+					len += strlen(args[i]) + 1;
 
 				desc = d = (char *)calloc(1, len);
 
-				d += sprintf(d, "%s", args[2]);
-				for(i=3; *args[i]; i++)
-					d += sprintf(d, " %s", args[i]);
+				d += snprintf(d, desc + len - d, "%s", args[2]);
+				for (i = 3; *args[i]; i++)
+					d += snprintf(d, desc + len - d, " %s", args[i]);
 			}
 
 			if (!*args[2] && !global.desc)
@@ -3459,6 +3585,72 @@ stats_error_parsing:
 				case KWM_DEF: /* already cleared */
 					break;
 				}
+				goto out;
+			}
+		}
+
+		/* HTTP options override each other. They can be cancelled using
+		 * "no option xxx" which only switches to default mode if the mode
+		 * was this one (useful for cancelling options set in defaults
+		 * sections).
+		 */
+		if (strcmp(args[1], "httpclose") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_PCL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "forceclose") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_FCL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "http-server-close") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_SCL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "http-keep-alive") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_KAL;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_KAL)
+					curproxy->options &= ~PR_O_HTTP_MODE;
+				goto out;
+			}
+		}
+		else if (strcmp(args[1], "http-tunnel") == 0) {
+			if (kwm == KWM_STD) {
+				curproxy->options &= ~PR_O_HTTP_MODE;
+				curproxy->options |= PR_O_HTTP_TUN;
+				goto out;
+			}
+			else if (kwm == KWM_NO) {
+				if ((curproxy->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
+					curproxy->options &= ~PR_O_HTTP_MODE;
 				goto out;
 			}
 		}
@@ -3762,7 +3954,7 @@ stats_error_parsing:
 			while (*(args[cur_arg])) {
 				if (!strcmp(args[cur_arg], "except")) {
 					/* suboption except - needs additional argument for it */
-					if (!*(args[cur_arg+1]) || !str2net(args[cur_arg+1], &curproxy->except_net, &curproxy->except_mask)) {
+					if (!*(args[cur_arg+1]) || !str2net(args[cur_arg+1], 1, &curproxy->except_net, &curproxy->except_mask)) {
 						Alert("parsing [%s:%d] : '%s %s %s' expects <address>[/mask] as argument.\n",
 						      file, linenum, args[0], args[1], args[cur_arg]);
 						err_code |= ERR_ALERT | ERR_FATAL;
@@ -3813,7 +4005,7 @@ stats_error_parsing:
 			while (*(args[cur_arg])) {
 				if (!strcmp(args[cur_arg], "except")) {
 					/* suboption except - needs additional argument for it */
-					if (!*(args[cur_arg+1]) || !str2net(args[cur_arg+1], &curproxy->except_to, &curproxy->except_mask_to)) {
+					if (!*(args[cur_arg+1]) || !str2net(args[cur_arg+1], 1, &curproxy->except_to, &curproxy->except_mask_to)) {
 						Alert("parsing [%s:%d] : '%s %s %s' expects <address>[/mask] as argument.\n",
 						      file, linenum, args[0], args[1], args[cur_arg]);
 						err_code |= ERR_ALERT | ERR_FATAL;
@@ -3985,7 +4177,70 @@ stats_error_parsing:
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
-		if (strcmp(args[1], "send") == 0) {
+		if (strcmp(args[1], "connect") == 0) {
+			const char *ptr_arg;
+			int cur_arg;
+			struct tcpcheck_rule *tcpcheck;
+			struct list *l;
+
+			/* check if first rule is also a 'connect' action */
+			l = (struct list *)&curproxy->tcpcheck_rules;
+			if (l->p != l->n) {
+				tcpcheck = (struct tcpcheck_rule *)l->n;
+				if (tcpcheck && tcpcheck->action != TCPCHK_ACT_CONNECT) {
+					Alert("parsing [%s:%d] : first step MUST also be a 'connect' when there is a 'connect' step in the tcp-check ruleset.\n",
+					      file, linenum);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+
+			cur_arg = 2;
+			tcpcheck = (struct tcpcheck_rule *)calloc(1, sizeof(*tcpcheck));
+			tcpcheck->action = TCPCHK_ACT_CONNECT;
+
+			/* parsing each parameters to fill up the rule */
+			while (*(ptr_arg = args[cur_arg])) {
+				/* tcp port */
+				if (strcmp(args[cur_arg], "port") == 0) {
+					if ( (atol(args[cur_arg + 1]) > 65535) ||
+							(atol(args[cur_arg + 1]) < 1) ){
+						Alert("parsing [%s:%d] : '%s %s %s' expects a valid TCP port (from range 1 to 65535), got %s.\n",
+						      file, linenum, args[0], args[1], "port", args[cur_arg + 1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->port = atol(args[cur_arg + 1]);
+					cur_arg += 2;
+				}
+				/* send proxy protocol */
+				else if (strcmp(args[cur_arg], "send-proxy") == 0) {
+					tcpcheck->conn_opts |= TCPCHK_OPT_SEND_PROXY;
+					cur_arg++;
+				}
+#ifdef USE_OPENSSL
+				else if (strcmp(args[cur_arg], "ssl") == 0) {
+					curproxy->options |= PR_O_TCPCHK_SSL;
+					tcpcheck->conn_opts |= TCPCHK_OPT_SSL;
+					cur_arg++;
+				}
+#endif /* USE_OPENSSL */
+				else {
+#ifdef USE_OPENSSL
+					Alert("parsing [%s:%d] : '%s %s' expects 'port', 'send-proxy' or 'ssl' but got '%s' as argument.\n",
+#else /* USE_OPENSSL */
+					Alert("parsing [%s:%d] : '%s %s' expects 'port', 'send-proxy' or but got '%s' as argument.\n",
+#endif /* USE_OPENSSL */
+					      file, linenum, args[0], args[1], args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+			}
+
+			LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
+		}
+		else if (strcmp(args[1], "send") == 0) {
 			if (! *(args[2]) ) {
 				/* SEND string expected */
 				Alert("parsing [%s:%d] : '%s %s %s' expects <STRING> as argument.\n",
@@ -4131,7 +4386,7 @@ stats_error_parsing:
 			}
 		}
 		else {
-			Alert("parsing [%s:%d] : '%s' only supports 'send' or 'expect'.\n", file, linenum, args[0]);
+			Alert("parsing [%s:%d] : '%s' only supports 'connect', 'send' or 'expect'.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -4342,824 +4597,6 @@ stats_error_parsing:
 			}
 		}
 	}
-	else if (!strcmp(args[0], "server") || !strcmp(args[0], "default-server")) {  /* server address */
-		int cur_arg;
-		short realport = 0;
-		int do_agent = 0, do_check = 0, defsrv = (*args[0] == 'd');
-
-		if (!defsrv && curproxy == &defproxy) {
-			Alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-		else if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
-			err_code |= ERR_ALERT | ERR_FATAL;
-
-		if (!*args[2]) {
-			Alert("parsing [%s:%d] : '%s' expects <name> and <addr>[:<port>] as arguments.\n",
-			      file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-
-		err = invalid_char(args[1]);
-		if (err && !defsrv) {
-			Alert("parsing [%s:%d] : character '%c' is not permitted in server name '%s'.\n",
-			      file, linenum, *err, args[1]);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-
-		if (!defsrv) {
-			struct sockaddr_storage *sk;
-			int port1, port2;
-			struct protocol *proto;
-
-			if ((newsrv = (struct server *)calloc(1, sizeof(struct server))) == NULL) {
-				Alert("parsing [%s:%d] : out of memory.\n", file, linenum);
-				err_code |= ERR_ALERT | ERR_ABORT;
-				goto out;
-			}
-
-			/* the servers are linked backwards first */
-			newsrv->next = curproxy->srv;
-			curproxy->srv = newsrv;
-			newsrv->proxy = curproxy;
-			newsrv->conf.file = strdup(file);
-			newsrv->conf.line = linenum;
-
-			newsrv->obj_type = OBJ_TYPE_SERVER;
-			LIST_INIT(&newsrv->actconns);
-			LIST_INIT(&newsrv->pendconns);
-			do_check = 0;
-			do_agent = 0;
-			newsrv->state = SRV_RUNNING; /* early server setup */
-			newsrv->last_change = now.tv_sec;
-			newsrv->id = strdup(args[1]);
-
-			/* several ways to check the port component :
-			 *  - IP    => port=+0, relative (IPv4 only)
-			 *  - IP:   => port=+0, relative
-			 *  - IP:N  => port=N, absolute
-			 *  - IP:+N => port=+N, relative
-			 *  - IP:-N => port=-N, relative
-			 */
-			sk = str2sa_range(args[2], &port1, &port2, &errmsg, NULL);
-			if (!sk) {
-				Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-
-			proto = protocol_by_family(sk->ss_family);
-			if (!proto || !proto->connect) {
-				Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
-				      file, linenum, args[0], args[1]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-
-			if (!port1 || !port2) {
-				/* no port specified, +offset, -offset */
-				newsrv->state |= SRV_MAPPORTS;
-			}
-			else if (port1 != port2) {
-				/* port range */
-				Alert("parsing [%s:%d] : '%s %s' : port ranges are not allowed in '%s'\n",
-				      file, linenum, args[0], args[1], args[2]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-			else {
-				/* used by checks */
-				realport = port1;
-			}
-
-			newsrv->addr = *sk;
-			newsrv->proto = newsrv->check_common.proto = protocol_by_family(newsrv->addr.ss_family);
-			newsrv->xprt  = newsrv->check_common.xprt  = &raw_sock;
-
-			if (!newsrv->proto) {
-				Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
-				      file, linenum, newsrv->addr.ss_family, args[2]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-
-			newsrv->check.use_ssl	= curproxy->defsrv.check.use_ssl;
-			newsrv->check.port	= curproxy->defsrv.check.port;
-			newsrv->check.inter	= curproxy->defsrv.check.inter;
-			newsrv->check.fastinter	= curproxy->defsrv.check.fastinter;
-			newsrv->check.downinter	= curproxy->defsrv.check.downinter;
-			newsrv->agent.use_ssl	= curproxy->defsrv.agent.use_ssl;
-			newsrv->agent.port	= curproxy->defsrv.agent.port;
-			newsrv->agent.inter	= curproxy->defsrv.agent.inter;
-			newsrv->agent.fastinter	= curproxy->defsrv.agent.fastinter;
-			newsrv->agent.downinter	= curproxy->defsrv.agent.downinter;
-			newsrv->maxqueue	= curproxy->defsrv.maxqueue;
-			newsrv->minconn		= curproxy->defsrv.minconn;
-			newsrv->maxconn		= curproxy->defsrv.maxconn;
-			newsrv->slowstart	= curproxy->defsrv.slowstart;
-			newsrv->onerror		= curproxy->defsrv.onerror;
-			newsrv->consecutive_errors_limit
-						= curproxy->defsrv.consecutive_errors_limit;
-#ifdef OPENSSL
-			newsrv->use_ssl		= curproxy->defsrv.use_ssl;
-#endif
-			newsrv->uweight = newsrv->iweight
-						= curproxy->defsrv.iweight;
-
-			newsrv->check.status	= HCHK_STATUS_INI;
-			newsrv->check.rise	= curproxy->defsrv.check.rise;
-			newsrv->check.fall	= curproxy->defsrv.check.fall;
-			newsrv->check.health	= newsrv->check.rise;	/* up, but will fall down at first failure */
-			newsrv->check.server	= newsrv;
-
-			newsrv->agent.status	= HCHK_STATUS_INI;
-			newsrv->agent.rise	= curproxy->defsrv.agent.rise;
-			newsrv->agent.fall	= curproxy->defsrv.agent.fall;
-			newsrv->agent.health	= newsrv->agent.rise;	/* up, but will fall down at first failure */
-			newsrv->agent.server	= newsrv;
-
-			cur_arg = 3;
-		} else {
-			newsrv = &curproxy->defsrv;
-			cur_arg = 1;
-		}
-
-		while (*args[cur_arg]) {
-			if (!strcmp(args[cur_arg], "agent-check")) {
-				global.maxsock++;
-				do_agent = 1;
-				cur_arg += 1;
-			} else if (!strcmp(args[cur_arg], "agent-inter")) {
-				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
-					Alert("parsing [%s:%d] : unexpected character '%c' in 'agent-inter' argument of server %s.\n",
-					      file, linenum, *err, newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				if (val <= 0) {
-					Alert("parsing [%s:%d]: invalid value %d for argument '%s' of server %s.\n",
-					      file, linenum, val, args[cur_arg], newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				newsrv->agent.inter = val;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "agent-port")) {
-				global.maxsock++;
-				newsrv->agent.port = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "cookie")) {
-				newsrv->cookie = strdup(args[cur_arg + 1]);
-				newsrv->cklen = strlen(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "redir")) {
-				newsrv->rdr_pfx = strdup(args[cur_arg + 1]);
-				newsrv->rdr_len = strlen(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "rise")) {
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: '%s' expects an integer argument.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->check.rise = atol(args[cur_arg + 1]);
-				if (newsrv->check.rise <= 0) {
-					Alert("parsing [%s:%d]: '%s' has to be > 0.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (newsrv->check.health)
-					newsrv->check.health = newsrv->check.rise;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "fall")) {
-				newsrv->check.fall = atol(args[cur_arg + 1]);
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: '%s' expects an integer argument.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (newsrv->check.fall <= 0) {
-					Alert("parsing [%s:%d]: '%s' has to be > 0.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "inter")) {
-				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
-					Alert("parsing [%s:%d] : unexpected character '%c' in 'inter' argument of server %s.\n",
-					      file, linenum, *err, newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				if (val <= 0) {
-					Alert("parsing [%s:%d]: invalid value %d for argument '%s' of server %s.\n",
-					      file, linenum, val, args[cur_arg], newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				newsrv->check.inter = val;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "fastinter")) {
-				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
-					Alert("parsing [%s:%d]: unexpected character '%c' in 'fastinter' argument of server %s.\n",
-					      file, linenum, *err, newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				if (val <= 0) {
-					Alert("parsing [%s:%d]: invalid value %d for argument '%s' of server %s.\n",
-					      file, linenum, val, args[cur_arg], newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				newsrv->check.fastinter = val;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "downinter")) {
-				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
-					Alert("parsing [%s:%d]: unexpected character '%c' in 'downinter' argument of server %s.\n",
-					      file, linenum, *err, newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				if (val <= 0) {
-					Alert("parsing [%s:%d]: invalid value %d for argument '%s' of server %s.\n",
-					      file, linenum, val, args[cur_arg], newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				newsrv->check.downinter = val;
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "addr")) {
-				struct sockaddr_storage *sk;
-				int port1, port2;
-				struct protocol *proto;
-
-				sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
-				if (!sk) {
-					Alert("parsing [%s:%d] : '%s' : %s\n",
-					      file, linenum, args[cur_arg], errmsg);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				proto = protocol_by_family(sk->ss_family);
-				if (!proto || !proto->connect) {
-					Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
-					      file, linenum, args[cur_arg], args[cur_arg + 1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				if (port1 != port2) {
-					Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
-					      file, linenum, args[cur_arg], args[cur_arg + 1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->check_common.addr = *sk;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "port")) {
-				newsrv->check.port = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "backup")) {
-				newsrv->state |= SRV_BACKUP;
-				cur_arg ++;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "non-stick")) {
-				newsrv->state |= SRV_NON_STICK;
-				cur_arg ++;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "send-proxy")) {
-				newsrv->state |= SRV_SEND_PROXY;
-				cur_arg ++;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "check-send-proxy")) {
-				newsrv->check.send_proxy = 1;
-				cur_arg ++;
-			}
-			else if (!strcmp(args[cur_arg], "weight")) {
-				int w;
-				w = atol(args[cur_arg + 1]);
-				if (w < 0 || w > SRV_UWGHT_MAX) {
-					Alert("parsing [%s:%d] : weight of server %s is not within 0 and %d (%d).\n",
-					      file, linenum, newsrv->id, SRV_UWGHT_MAX, w);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				newsrv->uweight = newsrv->iweight = w;
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "minconn")) {
-				newsrv->minconn = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "maxconn")) {
-				newsrv->maxconn = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "maxqueue")) {
-				newsrv->maxqueue = atol(args[cur_arg + 1]);
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "slowstart")) {
-				/* slowstart is stored in seconds */
-				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
-					Alert("parsing [%s:%d] : unexpected character '%c' in 'slowstart' argument of server %s.\n",
-					      file, linenum, *err, newsrv->id);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				newsrv->slowstart = (val + 999) / 1000;
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "track")) {
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: 'track' expects [<proxy>/]<server> as argument.\n",
-						file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->trackit = strdup(args[cur_arg + 1]);
-
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "check")) {
-				global.maxsock++;
-				do_check = 1;
-				cur_arg += 1;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "disabled")) {
-				newsrv->state |= SRV_MAINTAIN;
-				newsrv->state &= ~SRV_RUNNING;
-				newsrv->check.state |= CHK_ST_PAUSED;
-				newsrv->check.health = 0;
-				newsrv->agent.health = 0;
-				cur_arg += 1;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "observe")) {
-				if (!strcmp(args[cur_arg + 1], "none"))
-					newsrv->observe = HANA_OBS_NONE;
-				else if (!strcmp(args[cur_arg + 1], "layer4"))
-					newsrv->observe = HANA_OBS_LAYER4;
-				else if (!strcmp(args[cur_arg + 1], "layer7")) {
-					if (curproxy->mode != PR_MODE_HTTP) {
-						Alert("parsing [%s:%d]: '%s' can only be used in http proxies.\n",
-							file, linenum, args[cur_arg + 1]);
-						err_code |= ERR_ALERT;
-					}
-					newsrv->observe = HANA_OBS_LAYER7;
-				}
-				else {
-					Alert("parsing [%s:%d]: '%s' expects one of 'none', "
-						"'layer4', 'layer7' but got '%s'\n",
-						file, linenum, args[cur_arg], args[cur_arg + 1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "on-error")) {
-				if (!strcmp(args[cur_arg + 1], "fastinter"))
-					newsrv->onerror = HANA_ONERR_FASTINTER;
-				else if (!strcmp(args[cur_arg + 1], "fail-check"))
-					newsrv->onerror = HANA_ONERR_FAILCHK;
-				else if (!strcmp(args[cur_arg + 1], "sudden-death"))
-					newsrv->onerror = HANA_ONERR_SUDDTH;
-				else if (!strcmp(args[cur_arg + 1], "mark-down"))
-					newsrv->onerror = HANA_ONERR_MARKDWN;
-				else {
-					Alert("parsing [%s:%d]: '%s' expects one of 'fastinter', "
-						"'fail-check', 'sudden-death' or 'mark-down' but got '%s'\n",
-						file, linenum, args[cur_arg], args[cur_arg + 1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "on-marked-down")) {
-				if (!strcmp(args[cur_arg + 1], "shutdown-sessions"))
-					newsrv->onmarkeddown = HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS;
-				else {
-					Alert("parsing [%s:%d]: '%s' expects 'shutdown-sessions' but got '%s'\n",
-						file, linenum, args[cur_arg], args[cur_arg + 1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "on-marked-up")) {
-				if (!strcmp(args[cur_arg + 1], "shutdown-backup-sessions"))
-					newsrv->onmarkedup = HANA_ONMARKEDUP_SHUTDOWNBACKUPSESSIONS;
-				else {
-					Alert("parsing [%s:%d]: '%s' expects 'shutdown-backup-sessions' but got '%s'\n",
-						file, linenum, args[cur_arg], args[cur_arg + 1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				cur_arg += 2;
-			}
-			else if (!strcmp(args[cur_arg], "error-limit")) {
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d]: '%s' expects an integer argument.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->consecutive_errors_limit = atoi(args[cur_arg + 1]);
-
-				if (newsrv->consecutive_errors_limit <= 0) {
-					Alert("parsing [%s:%d]: %s has to be > 0.\n",
-						file, linenum, args[cur_arg]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				cur_arg += 2;
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "source")) {  /* address to which we bind when connecting */
-				int port_low, port_high;
-				struct sockaddr_storage *sk;
-				struct protocol *proto;
-
-				if (!*args[cur_arg + 1]) {
-					Alert("parsing [%s:%d] : '%s' expects <addr>[:<port>[-<port>]], and optionally '%s' <addr>, and '%s' <name> as argument.\n",
-					      file, linenum, "source", "usesrc", "interface");
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->conn_src.opts |= CO_SRC_BIND;
-				sk = str2sa_range(args[cur_arg + 1], &port_low, &port_high, &errmsg, NULL);
-				if (!sk) {
-					Alert("parsing [%s:%d] : '%s %s' : %s\n",
-					      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				proto = protocol_by_family(sk->ss_family);
-				if (!proto || !proto->connect) {
-					Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
-					      file, linenum, args[cur_arg], args[cur_arg+1]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				newsrv->conn_src.source_addr = *sk;
-
-				if (port_low != port_high) {
-					int i;
-
-					if (!port_low || !port_high) {
-						Alert("parsing [%s:%d] : %s does not support port offsets (found '%s').\n",
-						      file, linenum, args[cur_arg], args[cur_arg + 1]);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-
-					if (port_low  <= 0 || port_low > 65535 ||
-					    port_high <= 0 || port_high > 65535 ||
-					    port_low > port_high) {
-						Alert("parsing [%s:%d] : invalid source port range %d-%d.\n",
-						      file, linenum, port_low, port_high);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-					newsrv->conn_src.sport_range = port_range_alloc_range(port_high - port_low + 1);
-					for (i = 0; i < newsrv->conn_src.sport_range->size; i++)
-						newsrv->conn_src.sport_range->ports[i] = port_low + i;
-				}
-
-				cur_arg += 2;
-				while (*(args[cur_arg])) {
-					if (!strcmp(args[cur_arg], "usesrc")) {  /* address to use outside */
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
-#if !defined(CONFIG_HAP_TRANSPARENT)
-						if (!is_addr(&newsrv->conn_src.source_addr)) {
-							Alert("parsing [%s:%d] : '%s' requires an explicit '%s' address.\n",
-							      file, linenum, "usesrc", "source");
-							err_code |= ERR_ALERT | ERR_FATAL;
-							goto out;
-						}
-#endif
-						if (!*args[cur_arg + 1]) {
-							Alert("parsing [%s:%d] : '%s' expects <addr>[:<port>], 'client', 'clientip', or 'hdr_ip(name,#)' as argument.\n",
-							      file, linenum, "usesrc");
-							err_code |= ERR_ALERT | ERR_FATAL;
-							goto out;
-						}
-						if (!strcmp(args[cur_arg + 1], "client")) {
-							newsrv->conn_src.opts &= ~CO_SRC_TPROXY_MASK;
-							newsrv->conn_src.opts |= CO_SRC_TPROXY_CLI;
-						} else if (!strcmp(args[cur_arg + 1], "clientip")) {
-							newsrv->conn_src.opts &= ~CO_SRC_TPROXY_MASK;
-							newsrv->conn_src.opts |= CO_SRC_TPROXY_CIP;
-						} else if (!strncmp(args[cur_arg + 1], "hdr_ip(", 7)) {
-							char *name, *end;
-
-							name = args[cur_arg+1] + 7;
-							while (isspace(*name))
-								name++;
-
-							end = name;
-							while (*end && !isspace(*end) && *end != ',' && *end != ')')
-								end++;
-
-							newsrv->conn_src.opts &= ~CO_SRC_TPROXY_MASK;
-							newsrv->conn_src.opts |= CO_SRC_TPROXY_DYN;
-							newsrv->conn_src.bind_hdr_name = calloc(1, end - name + 1);
-							newsrv->conn_src.bind_hdr_len = end - name;
-							memcpy(newsrv->conn_src.bind_hdr_name, name, end - name);
-							newsrv->conn_src.bind_hdr_name[end-name] = '\0';
-							newsrv->conn_src.bind_hdr_occ = -1;
-
-							/* now look for an occurrence number */
-							while (isspace(*end))
-								end++;
-							if (*end == ',') {
-								end++;
-								name = end;
-								if (*end == '-')
-									end++;
-								while (isdigit((int)*end))
-									end++;
-								newsrv->conn_src.bind_hdr_occ = strl2ic(name, end-name);
-							}
-
-							if (newsrv->conn_src.bind_hdr_occ < -MAX_HDR_HISTORY) {
-								Alert("parsing [%s:%d] : usesrc hdr_ip(name,num) does not support negative"
-								      " occurrences values smaller than %d.\n",
-								      file, linenum, MAX_HDR_HISTORY);
-								err_code |= ERR_ALERT | ERR_FATAL;
-								goto out;
-							}
-						} else {
-							struct sockaddr_storage *sk;
-							int port1, port2;
-
-							sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
-							if (!sk) {
-								Alert("parsing [%s:%d] : '%s %s' : %s\n",
-								      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
-								err_code |= ERR_ALERT | ERR_FATAL;
-								goto out;
-							}
-
-							proto = protocol_by_family(sk->ss_family);
-							if (!proto || !proto->connect) {
-								Alert("parsing [%s:%d] : '%s %s' : connect() not supported for this address family.\n",
-								      file, linenum, args[cur_arg], args[cur_arg+1]);
-								err_code |= ERR_ALERT | ERR_FATAL;
-								goto out;
-							}
-
-							if (port1 != port2) {
-								Alert("parsing [%s:%d] : '%s' : port ranges and offsets are not allowed in '%s'\n",
-								      file, linenum, args[cur_arg], args[cur_arg + 1]);
-								err_code |= ERR_ALERT | ERR_FATAL;
-								goto out;
-							}
-							newsrv->conn_src.tproxy_addr = *sk;
-							newsrv->conn_src.opts |= CO_SRC_TPROXY_ADDR;
-						}
-						global.last_checks |= LSTCHK_NETADM;
-#if !defined(CONFIG_HAP_TRANSPARENT)
-						global.last_checks |= LSTCHK_CTTPROXY;
-#endif
-						cur_arg += 2;
-						continue;
-#else	/* no TPROXY support */
-						Alert("parsing [%s:%d] : '%s' not allowed here because support for TPROXY was not compiled in.\n",
-						      file, linenum, "usesrc");
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-#endif /* defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT) */
-					} /* "usesrc" */
-
-					if (!strcmp(args[cur_arg], "interface")) { /* specifically bind to this interface */
-#ifdef SO_BINDTODEVICE
-						if (!*args[cur_arg + 1]) {
-							Alert("parsing [%s:%d] : '%s' : missing interface name.\n",
-							      file, linenum, args[0]);
-							err_code |= ERR_ALERT | ERR_FATAL;
-							goto out;
-						}
-						free(newsrv->conn_src.iface_name);
-						newsrv->conn_src.iface_name = strdup(args[cur_arg + 1]);
-						newsrv->conn_src.iface_len  = strlen(newsrv->conn_src.iface_name);
-						global.last_checks |= LSTCHK_NETADM;
-#else
-						Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
-						      file, linenum, args[0], args[cur_arg]);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-#endif
-						cur_arg += 2;
-						continue;
-					}
-					/* this keyword in not an option of "source" */
-					break;
-				} /* while */
-			}
-			else if (!defsrv && !strcmp(args[cur_arg], "usesrc")) {  /* address to use outside: needs "source" first */
-				Alert("parsing [%s:%d] : '%s' only allowed after a '%s' statement.\n",
-				      file, linenum, "usesrc", "source");
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-			else {
-				static int srv_dumped;
-				struct srv_kw *kw;
-				char *err;
-
-				kw = srv_find_kw(args[cur_arg]);
-				if (kw) {
-					char *err = NULL;
-					int code;
-
-					if (!kw->parse) {
-						Alert("parsing [%s:%d] : '%s %s' : '%s' option is not implemented in this version (check build options).\n",
-						      file, linenum, args[0], args[1], args[cur_arg]);
-						cur_arg += 1 + kw->skip ;
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-
-					if (defsrv && !kw->default_ok) {
-						Alert("parsing [%s:%d] : '%s %s' : '%s' option is not accepted in default-server sections.\n",
-						      file, linenum, args[0], args[1], args[cur_arg]);
-						cur_arg += 1 + kw->skip ;
-						err_code |= ERR_ALERT;
-						continue;
-					}
-
-					code = kw->parse(args, &cur_arg, curproxy, newsrv, &err);
-					err_code |= code;
-
-					if (code) {
-						if (err && *err) {
-							indent_msg(&err, 2);
-							Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
-						}
-						else
-							Alert("parsing [%s:%d] : '%s %s' : error encountered while processing '%s'.\n",
-							      file, linenum, args[0], args[1], args[cur_arg]);
-						if (code & ERR_FATAL) {
-							free(err);
-							cur_arg += 1 + kw->skip;
-							goto out;
-						}
-					}
-					free(err);
-					cur_arg += 1 + kw->skip;
-					continue;
-				}
-
-				err = NULL;
-				if (!srv_dumped) {
-					srv_dump_kws(&err);
-					indent_msg(&err, 4);
-					srv_dumped = 1;
-				}
-
-				Alert("parsing [%s:%d] : '%s %s' unknown keyword '%s'.%s%s\n",
-				      file, linenum, args[0], args[1], args[cur_arg],
-				      err ? " Registered keywords :" : "", err ? err : "");
-				free(err);
-
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-		}
-
-		/* Set initial drain state using now-configured weight */
-		set_server_drain_state(newsrv);
-
-		if (do_check) {
-			int ret;
-
-			if (newsrv->trackit) {
-				Alert("parsing [%s:%d]: unable to enable checks and tracking at the same time!\n",
-					file, linenum);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-
-			/* If neither a port nor an addr was specified and no check transport
-			 * layer is forced, then the transport layer used by the checks is the
-			 * same as for the production traffic. Otherwise we use raw_sock by
-			 * default, unless one is specified.
-			 */
-			if (!newsrv->check.port && !is_addr(&newsrv->check_common.addr)) {
-#ifdef USE_OPENSSL
-				newsrv->check.use_ssl |= newsrv->use_ssl;
-#endif
-				newsrv->check.send_proxy |= (newsrv->state & SRV_SEND_PROXY);
-			}
-			/* try to get the port from check_core.addr if check.port not set */
-			if (!newsrv->check.port)
-				newsrv->check.port = get_host_port(&newsrv->check_common.addr);
-
-			if (!newsrv->check.port)
-				newsrv->check.port = realport; /* by default */
-
-			if (!newsrv->check.port) {
-				/* not yet valid, because no port was set on
-				 * the server either. We'll check if we have
-				 * a known port on the first listener.
-				 */
-				struct listener *l;
-
-				list_for_each_entry(l, &curproxy->conf.listeners, by_fe) {
-					newsrv->check.port = get_host_port(&l->addr);
-					if (newsrv->check.port)
-						break;
-				}
-			}
-			if (!newsrv->check.port) {
-				Alert("parsing [%s:%d] : server %s has neither service port nor check port. Check has been disabled.\n",
-				      file, linenum, newsrv->id);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-
-			/* note: check type will be set during the config review phase */
-			ret = init_check(&newsrv->check, 0, file, linenum);
-			if (ret) {
-				err_code |= ret;
-				goto out;
-			}
-
-			newsrv->check.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED;
-		}
-
-		if (do_agent) {
-			int ret;
-
-			if (!newsrv->agent.port) {
-				Alert("parsing [%s:%d] : server %s does not have agent port. Agent check has been disabled.\n",
-				      file, linenum, newsrv->id);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-
-			if (!newsrv->agent.inter)
-				newsrv->agent.inter = newsrv->check.inter;
-
-			ret = init_check(&newsrv->agent, PR_O2_LB_AGENT_CHK, file, linenum);
-			if (ret) {
-				err_code |= ret;
-				goto out;
-			}
-
-			newsrv->agent.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED | CHK_ST_AGENT;
-		}
-
-		if (!defsrv) {
-			if (newsrv->state & SRV_BACKUP)
-				curproxy->srv_bck++;
-			else
-				curproxy->srv_act++;
-
-			newsrv->prev_state = newsrv->state;
-		}
-	}
-
 	else if (strcmp(args[0], "unique-id-format") == 0) {
 		if (!*(args[1])) {
 			Alert("parsing [%s:%d] : %s expects an argument.\n", file, linenum, args[0]);
@@ -5767,11 +5204,13 @@ stats_error_parsing:
 
 		errnum = atol(args[1]);
 		if (!strcmp(args[0], "errorloc303")) {
-			err = malloc(strlen(HTTP_303) + strlen(args[2]) + 5);
-			errlen = sprintf(err, "%s%s\r\n\r\n", HTTP_303, args[2]);
+			errlen = strlen(HTTP_303) + strlen(args[2]) + 5;
+			err = malloc(errlen);
+			errlen = snprintf(err, errlen, "%s%s\r\n\r\n", HTTP_303, args[2]);
 		} else {
-			err = malloc(strlen(HTTP_302) + strlen(args[2]) + 5);
-			errlen = sprintf(err, "%s%s\r\n\r\n", HTTP_302, args[2]);
+			errlen = strlen(HTTP_302) + strlen(args[2]) + 5;
+			err = malloc(errlen);
+			errlen = snprintf(err, errlen, "%s%s\r\n\r\n", HTTP_302, args[2]);
 		}
 
 		for (rc = 0; rc < HTTP_ERR_SIZE; rc++) {
@@ -5988,10 +5427,8 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		newul->groupusers = calloc(MAX_AUTH_GROUPS, sizeof(char *));
 		newul->name = strdup(args[1]);
-
-		if (!newul->groupusers | !newul->name) {
+		if (!newul->name) {
 			Alert("parsing [%s:%d]: out of memory.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
@@ -6001,8 +5438,9 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 		userlist = newul;
 
 	} else if (!strcmp(args[0], "group")) {  	/* new group */
-		int cur_arg, i;
+		int cur_arg;
 		const char *err;
+		struct auth_groups *ag;
 
 		if (!*args[1]) {
 			Alert("parsing [%s:%d]: '%s' expects <name> as arguments.\n",
@@ -6019,18 +5457,25 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		for(i = 0; i < userlist->grpcnt; i++)
-			if (!strcmp(userlist->groups[i], args[1])) {
+		for (ag = userlist->groups; ag; ag = ag->next)
+			if (!strcmp(ag->name, args[1])) {
 				Warning("parsing [%s:%d]: ignoring duplicated group '%s' in userlist '%s'.\n",
 				      file, linenum, args[1], userlist->name);
 				err_code |= ERR_ALERT;
 				goto out;
 			}
 
-		if (userlist->grpcnt >= MAX_AUTH_GROUPS) {
-			Alert("parsing [%s:%d]: too many groups (%u) in in userlist '%s' while adding group '%s'.\n",
-			      file, linenum, MAX_AUTH_GROUPS, userlist->name, args[1]);
-			err_code |= ERR_ALERT | ERR_FATAL;
+		ag = calloc(1, sizeof(*ag));
+		if (!ag) {
+			Alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		ag->name = strdup(args[1]);
+		if (!ag) {
+			Alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
 
@@ -6038,7 +5483,7 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 
 		while (*args[cur_arg]) {
 			if (!strcmp(args[cur_arg], "users")) {
-				userlist->groupusers[userlist->grpcnt] = strdup(args[cur_arg + 1]);
+				ag->groupusers = strdup(args[cur_arg + 1]);
 				cur_arg += 2;
 				continue;
 			} else {
@@ -6049,7 +5494,9 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 			}
 		}
 
-		userlist->groups[userlist->grpcnt++] = strdup(args[1]);
+		ag->next = userlist->groups;
+		userlist->groups = ag;
+
 	} else if (!strcmp(args[0], "user")) {		/* new user */
 		struct auth_users *newuser;
 		int cur_arg;
@@ -6099,7 +5546,7 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 				cur_arg += 2;
 				continue;
 			} else if (!strcmp(args[cur_arg], "groups")) {
-				newuser->u.groups = strdup(args[cur_arg + 1]);
+				newuser->u.groups_names = strdup(args[cur_arg + 1]);
 				cur_arg += 2;
 				continue;
 			} else {
@@ -6133,8 +5580,20 @@ int readcfgfile(const char *file)
 	char thisline[LINESIZE];
 	FILE *f;
 	int linenum = 0;
-	int confsect = CFG_NONE;
 	int err_code = 0;
+	struct cfg_section *cs = NULL;
+	struct cfg_section *ics;
+
+	/* Register internal sections */
+	if (!cfg_register_section("listen",   cfg_parse_listen) ||
+	    !cfg_register_section("frontend", cfg_parse_listen) ||
+	    !cfg_register_section("backend",  cfg_parse_listen) ||
+	    !cfg_register_section("ruleset",  cfg_parse_listen) ||
+	    !cfg_register_section("defaults", cfg_parse_listen) ||
+	    !cfg_register_section("global",   cfg_parse_global) ||
+	    !cfg_register_section("userlist", cfg_parse_users)  ||
+	    !cfg_register_section("peers",    cfg_parse_peers))
+		return -1;
 
 	if ((f=fopen(file,"r")) == NULL)
 		return -1;
@@ -6274,47 +5733,19 @@ int readcfgfile(const char *file)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 
-		if (!strcmp(args[0], "listen") ||
-		    !strcmp(args[0], "frontend") ||
-		    !strcmp(args[0], "backend") ||
-		    !strcmp(args[0], "ruleset") ||
-		    !strcmp(args[0], "defaults")) { /* new proxy */
-			confsect = CFG_LISTEN;
-			free(cursection);
-			cursection = strdup(args[0]);
-		}
-		else if (!strcmp(args[0], "global")) { /* global config */
-			confsect = CFG_GLOBAL;
-			free(cursection);
-			cursection = strdup(args[0]);
-		}
-		else if (!strcmp(args[0], "userlist")) {
-			confsect = CFG_USERLIST;
-			free(cursection);
-			cursection = strdup(args[0]);
-		}
-		else if (!strcmp(args[0], "peers")) {
-			confsect = CFG_PEERS;
-			free(cursection);
-			cursection = strdup(args[0]);
+		/* detect section start */
+		list_for_each_entry(ics, &sections, list) {
+			if (strcmp(args[0], ics->section_name) == 0) {
+				cursection = ics->section_name;
+				cs = ics;
+				break;
+			}
 		}
 
 		/* else it's a section keyword */
-
-		switch (confsect) {
-		case CFG_LISTEN:
-			err_code |= cfg_parse_listen(file, linenum, args, kwm);
-			break;
-		case CFG_GLOBAL:
-			err_code |= cfg_parse_global(file, linenum, args, kwm);
-			break;
-		case CFG_USERLIST:
-			err_code |= cfg_parse_users(file, linenum, args, kwm);
-			break;
-		case CFG_PEERS:
-			err_code |= cfg_parse_peers(file, linenum, args, kwm);
-			break;
-		default:
+		if (cs)
+			err_code |= cs->section_parser(file, linenum, args, kwm);
+		else {
 			Alert("parsing [%s:%d]: unknown keyword '%s' out of section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
@@ -6322,7 +5753,6 @@ int readcfgfile(const char *file)
 		if (err_code & ERR_ABORT)
 			break;
 	}
-	free(cursection);
 	cursection = NULL;
 	fclose(f);
 	return err_code;
@@ -6342,7 +5772,6 @@ int check_config_validity()
 	int cfgerr = 0;
 	struct proxy *curproxy = NULL;
 	struct server *newsrv = NULL;
-	struct userlist *curuserlist = NULL;
 	int err_code = 0;
 	unsigned int next_pxid = 1;
 	struct bind_conf *bind_conf;
@@ -6362,6 +5791,11 @@ int check_config_validity()
 		global.tune.cookie_len = CAPTURE_LEN;
 
 	pool2_capture = create_pool("capture", global.tune.cookie_len, MEM_F_SHARED);
+
+	/* Post initialisation of the users and groups lists. */
+	err_code = userlist_postinit();
+	if (err_code != ERR_NONE)
+		goto out;
 
 	/* first, we will invert the proxy list order */
 	curproxy = NULL;
@@ -6546,6 +5980,33 @@ int check_config_validity()
 		/* find the target proxy for 'use_backend' rules */
 		list_for_each_entry(rule, &curproxy->switching_rules, list) {
 			struct proxy *target;
+			struct logformat_node *node;
+			char *pxname;
+
+			/* Try to parse the string as a log format expression. If the result
+			 * of the parsing is only one entry containing a simple string, then
+			 * it's a standard string corresponding to a static rule, thus the
+			 * parsing is cancelled and be.name is restored to be resolved.
+			 */
+			pxname = rule->be.name;
+			LIST_INIT(&rule->be.expr);
+			parse_logformat_string(pxname, curproxy, &rule->be.expr, 0, SMP_VAL_FE_HRQ_HDR,
+			                       curproxy->conf.args.file, curproxy->conf.args.line);
+			node = LIST_NEXT(&rule->be.expr, struct logformat_node *, list);
+
+			if (!LIST_ISEMPTY(&rule->be.expr)) {
+				if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr) {
+					rule->dynamic = 1;
+					free(pxname);
+					continue;
+				}
+				/* simple string: free the expression and fall back to static rule */
+				free(node->arg);
+				free(node);
+			}
+
+			rule->dynamic = 0;
+			rule->be.name = pxname;
 
 			target = findproxy_mode(rule->be.name, curproxy->mode, PR_CAP_BE);
 
@@ -6816,7 +6277,7 @@ out_uri_auth_compat:
 			curproxy->conf.args.file = curproxy->conf.lfs_file;
 			curproxy->conf.args.line = curproxy->conf.lfs_line;
 			parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat, LOG_OPT_MANDATORY,
-					       SMP_VAL_FE_LOG_END);
+					       SMP_VAL_FE_LOG_END, curproxy->conf.lfs_file, curproxy->conf.lfs_line);
 			curproxy->conf.args.file = NULL;
 			curproxy->conf.args.line = 0;
 		}
@@ -6825,13 +6286,16 @@ out_uri_auth_compat:
 			curproxy->conf.args.ctx = ARGC_UIF;
 			curproxy->conf.args.file = curproxy->conf.uif_file;
 			curproxy->conf.args.line = curproxy->conf.uif_line;
-			parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id, 0,
-					       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR);
+			parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id, LOG_OPT_HTTP,
+					       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+					       curproxy->conf.uif_file, curproxy->conf.uif_line);
 			curproxy->conf.args.file = NULL;
 			curproxy->conf.args.line = 0;
 		}
 
-		/* only now we can check if some args remain unresolved */
+		/* only now we can check if some args remain unresolved.
+		 * This must be done after the users and groups resolution.
+		 */
 		cfgerr += smp_resolve_args(curproxy);
 		if (!cfgerr)
 			cfgerr += acl_find_targets(curproxy);
@@ -6935,6 +6399,30 @@ out_uri_auth_compat:
 			if (!next)
 				break;
 			curproxy->srv = next;
+		}
+
+		/* Check that no server name conflicts. This causes trouble in the stats.
+		 * We only emit a warning for the first conflict affecting each server,
+		 * in order to avoid combinatory explosion if all servers have the same
+		 * name. We do that only for servers which do not have an explicit ID,
+		 * because these IDs were made also for distinguishing them and we don't
+		 * want to annoy people who correctly manage them.
+		 */
+		for (newsrv = curproxy->srv; newsrv; newsrv = newsrv->next) {
+			struct server *other_srv;
+
+			if (newsrv->puid)
+				continue;
+
+			for (other_srv = curproxy->srv; other_srv && other_srv != newsrv; other_srv = other_srv->next) {
+				if (!other_srv->puid && strcmp(other_srv->id, newsrv->id) == 0) {
+					Warning("parsing [%s:%d] : %s '%s', another server named '%s' was defined without an explicit ID at line %d, this is not recommended.\n",
+						newsrv->conf.file, newsrv->conf.line,
+						proxy_type_str(curproxy), curproxy->id,
+						newsrv->id, other_srv->conf.line);
+					break;
+				}
+			}
 		}
 
 		/* assign automatic UIDs to servers which don't have one yet */
@@ -7396,78 +6884,6 @@ out_uri_auth_compat:
 		}
 	}
 
-	for (curuserlist = userlist; curuserlist; curuserlist = curuserlist->next) {
-		struct auth_users *curuser;
-		int g;
-
-		for (curuser = curuserlist->users; curuser; curuser = curuser->next) {
-			unsigned int group_mask = 0;
-			char *group = NULL;
-
-			if (!curuser->u.groups)
-				continue;
-
-			while ((group = strtok(group?NULL:curuser->u.groups, ","))) {
-
-				for (g = 0; g < curuserlist->grpcnt; g++)
-					if (!strcmp(curuserlist->groups[g], group))
-						break;
-
-				if (g == curuserlist->grpcnt) {
-					Alert("userlist '%s': no such group '%s' specified in user '%s'\n",
-					      curuserlist->name, group, curuser->user);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				group_mask |= (1 << g);
-			}
-
-			free(curuser->u.groups);
-			curuser->u.group_mask = group_mask;
-		}
-
-		for (g = 0; g < curuserlist->grpcnt; g++) {
-			char *user = NULL;
-
-			if (!curuserlist->groupusers[g])
-				continue;
-
-			while ((user = strtok(user?NULL:curuserlist->groupusers[g], ","))) {
-				for (curuser = curuserlist->users; curuser; curuser = curuser->next)
-					if (!strcmp(curuser->user, user))
-						break;
-
-				if (!curuser) {
-					Alert("userlist '%s': no such user '%s' specified in group '%s'\n",
-					      curuserlist->name, user, curuserlist->groups[g]);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-
-				curuser->u.group_mask |= (1 << g);
-			}
-
-			free(curuserlist->groupusers[g]);
-		}
-
-		free(curuserlist->groupusers);
-
-#ifdef DEBUG_AUTH
-		for (g = 0; g < curuserlist->grpcnt; g++) {
-			fprintf(stderr, "group %s, id %d, mask %08X, users:", curuserlist->groups[g], g , 1 << g);
-
-			for (curuser = curuserlist->users; curuser; curuser = curuser->next) {
-				if (curuser->u.group_mask & (1 << g))
-					fprintf(stderr, " %s", curuser->user);
-			}
-
-			fprintf(stderr, "\n");
-		}
-#endif
-
-	}
-
 	/* automatically compute fullconn if not set. We must not do it in the
 	 * loop above because cross-references are not yet fully resolved.
 	 */
@@ -7500,7 +6916,7 @@ out_uri_auth_compat:
 				/* check if a "use_backend" rule matches */
 				if (!found) {
 					list_for_each_entry(rule, &fe->switching_rules, list) {
-						if (rule->be.backend == curproxy) {
+						if (!rule->dynamic && rule->be.backend == curproxy) {
 							found = 1;
 							break;
 						}
@@ -7538,6 +6954,9 @@ out_uri_auth_compat:
 	 * other proxies.
 	 */
 	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+		if (curproxy->state == PR_STSTOPPED)
+			continue;
+
 		if (!stktable_init(&curproxy->table)) {
 			Alert("Proxy '%s': failed to initialize stick-table.\n", curproxy->id);
 			cfgerr++;
@@ -7624,6 +7043,30 @@ void cfg_unregister_keywords(struct cfg_kw_list *kwl)
 {
 	LIST_DEL(&kwl->list);
 	LIST_INIT(&kwl->list);
+}
+
+/* this function register new section in the haproxy configuration file.
+ * <section_name> is the name of this new section and <section_parser>
+ * is the called parser. If two section declaration have the same name,
+ * only the first declared is used.
+ */
+int cfg_register_section(char *section_name,
+                         int (*section_parser)(const char *, int, char **, int))
+{
+	struct cfg_section *cs;
+
+	cs = calloc(1, sizeof(*cs));
+	if (!cs) {
+		Alert("register section '%s': out of memory.\n", section_name);
+		return 0;
+	}
+
+	cs->section_name = section_name;
+	cs->section_parser = section_parser;
+
+	LIST_ADDQ(&sections, &cs->list);
+
+	return 1;
 }
 
 /*

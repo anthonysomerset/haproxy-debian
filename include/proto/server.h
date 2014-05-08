@@ -25,15 +25,19 @@
 #include <unistd.h>
 
 #include <common/config.h>
+#include <common/time.h>
 #include <types/proxy.h>
 #include <types/queue.h>
 #include <types/server.h>
 
 #include <proto/queue.h>
+#include <proto/log.h>
 #include <proto/freq_ctr.h>
 
 int srv_downtime(const struct server *s);
+int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
+int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy);
 
 /* increase the number of cumulated connections on the designated server */
 static void inline srv_inc_sess_ctr(struct server *s)
@@ -42,6 +46,12 @@ static void inline srv_inc_sess_ctr(struct server *s)
 	update_freq_ctr(&s->sess_per_sec, 1);
 	if (s->sess_per_sec.curr_ctr > s->counters.sps_max)
 		s->counters.sps_max = s->sess_per_sec.curr_ctr;
+}
+
+/* set the time of last session on the designated server */
+static void inline srv_set_sess_last(struct server *s)
+{
+	s->counters.last_sess = now.tv_sec;
 }
 
 #endif /* _PROTO_SERVER_H */

@@ -594,8 +594,6 @@ static sample_to_key_fct sample_to_key[SMP_TYPES][STKTABLE_TYPES] = {
 /*             IPV6 */ { k_ip2ip,  k_ip2ipv6,   k_ip2int,  k_ip2str,   NULL      },
 /*              STR */ { k_str2ip, k_str2ipv6,  k_str2int, k_str2str,  k_str2str },
 /*              BIN */ { NULL,     NULL,        NULL,      k_bin2str,  k_str2str },
-/*             CSTR */ { k_str2ip, k_str2ipv6,  k_str2int, k_str2str,  k_str2str },
-/*             CBIN */ { NULL,     NULL,        NULL,      k_bin2str,  k_str2str },
 };
 
 
@@ -716,9 +714,15 @@ int stktable_get_data_type(char *name)
 struct proxy *find_stktable(const char *name)
 {
 	struct proxy *px;
+	struct ebpt_node *node;
 
-	for (px = proxy; px; px = px->next) {
-		if (px->table.size && strcmp(px->id, name) == 0)
+	for (node = ebis_lookup(&proxy_by_name, name); node; node = ebpt_next(node)) {
+		px = container_of(node, struct proxy, conf.by_name);
+
+		if (strcmp(px->id, name) != 0)
+			break;
+
+		if (px->table.size)
 			return px;
 	}
 	return NULL;

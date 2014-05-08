@@ -57,12 +57,19 @@
 #define GTUNE_USE_KQUEUE         (1<<3)
 /* platform-specific options */
 #define GTUNE_USE_SPLICE         (1<<4)
+#define GTUNE_USE_GAI            (1<<5)
 
 /* Access level for a stats socket */
 #define ACCESS_LVL_NONE     0
 #define ACCESS_LVL_USER     1
 #define ACCESS_LVL_OPER     2
 #define ACCESS_LVL_ADMIN    3
+
+/* SSL server verify mode */
+enum {
+	SSL_SERVER_VERIFY_NONE = 0,
+	SSL_SERVER_VERIFY_REQUIRED = 1,
+};
 
 /* FIXME : this will have to be redefined correctly */
 struct global {
@@ -79,10 +86,15 @@ struct global {
 	char *listen_default_ciphers;
 	char *connect_default_ciphers;
 #endif
+	unsigned int ssl_server_verify; /* default verify mode on servers side */
 	struct freq_ctr conn_per_sec;
+	struct freq_ctr sess_per_sec;
+	struct freq_ctr ssl_per_sec;
 	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
 	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
 	int cps_lim, cps_max;
+	int sps_lim, sps_max;
+	int ssl_lim, ssl_max;
 	int comp_rate_lim;           /* HTTP compression rate limit */
 	int maxpipes;		/* max # of pipes */
 	int maxsock;		/* max # of sockets */
@@ -90,9 +102,10 @@ struct global {
 	int rlimit_memmax;	/* default ulimit-d in megs value : 0=unset */
 	long maxzlibmem;        /* max RAM for zlib in bytes */
 	int mode;
-	unsigned int req_count; /* HTTP request counter for logs and unique_id */
+	unsigned int req_count; /* request counter (HTTP or TCP session) for logs and unique_id */
 	int last_checks;
 	int spread_checks;
+	int max_spread_checks;
 	char *chroot;
 	char *pidfile;
 	char *node, *desc;		/* node name & description */
@@ -124,6 +137,7 @@ struct global {
 		int zlibwindowsize;  /* zlib window size */
 #endif
 		int comp_maxlevel;    /* max HTTP compression level */
+		unsigned short idle_timer; /* how long before an empty buffer is considered idle (ms) */
 	} tune;
 	struct {
 		char *prefix;           /* path prefix of unix bind socket */

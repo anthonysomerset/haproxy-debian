@@ -160,6 +160,9 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
 #if defined(IPV6_TRANSPARENT)
 			    || (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) == 0)
 #endif
+#if defined(IP_FREEBIND)
+			    || (setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one)) == 0)
+#endif
 #if defined(IPV6_BINDANY)
 			    || (setsockopt(fd, IPPROTO_IPV6, IPV6_BINDANY, &one, sizeof(one)) == 0)
 #endif
@@ -279,6 +282,8 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	struct proxy *be;
 	struct conn_src *src;
 
+	conn->flags = CO_FL_WAIT_L4_CONN; /* connection in progress */
+
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
 		be = objt_proxy(conn->target);
@@ -289,25 +294,39 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 		be = srv->proxy;
 		break;
 	default:
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_INTERNAL;
 	}
 
 	if ((fd = conn->t.sock.fd = socket(conn->addr.to.ss_family, SOCK_STREAM, IPPROTO_TCP)) == -1) {
 		qfprintf(stderr, "Cannot get a server socket.\n");
 
-		if (errno == ENFILE)
+		if (errno == ENFILE) {
+			conn->err_code = CO_ER_SYS_FDLIM;
 			send_log(be, LOG_EMERG,
 				 "Proxy %s reached system FD limit at %d. Please check system tunables.\n",
 				 be->id, maxfd);
-		else if (errno == EMFILE)
+		}
+		else if (errno == EMFILE) {
+			conn->err_code = CO_ER_PROC_FDLIM;
 			send_log(be, LOG_EMERG,
 				 "Proxy %s reached process FD limit at %d. Please check 'ulimit-n' and restart.\n",
 				 be->id, maxfd);
-		else if (errno == ENOBUFS || errno == ENOMEM)
+		}
+		else if (errno == ENOBUFS || errno == ENOMEM) {
+			conn->err_code = CO_ER_SYS_MEMLIM;
 			send_log(be, LOG_EMERG,
 				 "Proxy %s reached system memory limit at %d sockets. Please check system tunables.\n",
 				 be->id, maxfd);
+		}
+		else if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
+			conn->err_code = CO_ER_NOPROTO;
+		}
+		else
+			conn->err_code = CO_ER_SOCK_ERR;
+
 		/* this is a resource error */
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_RESOURCE;
 	}
 
@@ -317,6 +336,8 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 		 */
 		Alert("socket(): not enough free sockets. Raise -n argument. Giving up.\n");
 		close(fd);
+		conn->err_code = CO_ER_CONF_FDLIM;
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_PRXCOND; /* it is a configuration limit */
 	}
 
@@ -324,6 +345,8 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == -1)) {
 		qfprintf(stderr,"Cannot set client socket to non blocking mode.\n");
 		close(fd);
+		conn->err_code = CO_ER_SOCK_ERR;
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_INTERNAL;
 	}
 
@@ -382,17 +405,23 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 				attempts--;
 
 				fdinfo[fd].local_port = port_range_alloc_port(src->sport_range);
-				if (!fdinfo[fd].local_port)
+				if (!fdinfo[fd].local_port) {
+					conn->err_code = CO_ER_PORT_RANGE;
 					break;
+				}
 
 				fdinfo[fd].port_range = src->sport_range;
 				set_host_port(&sa, fdinfo[fd].local_port);
 
 				ret = tcp_bind_socket(fd, flags, &sa, &conn->addr.from);
+				if (ret != 0)
+					conn->err_code = CO_ER_CANT_BIND;
 			} while (ret != 0); /* binding NOK */
 		}
 		else {
 			ret = tcp_bind_socket(fd, flags, &src->source_addr, &conn->addr.from);
+			if (ret != 0)
+				conn->err_code = CO_ER_CANT_BIND;
 		}
 
 		if (unlikely(ret != 0)) {
@@ -413,6 +442,7 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 					 "Cannot bind to tproxy source address before connect() for backend %s.\n",
 					 be->id);
 			}
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_RESOURCE;
 		}
 	}
@@ -440,22 +470,29 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 
 		if (errno == EAGAIN || errno == EADDRINUSE || errno == EADDRNOTAVAIL) {
 			char *msg;
-			if (errno == EAGAIN || errno == EADDRNOTAVAIL)
+			if (errno == EAGAIN || errno == EADDRNOTAVAIL) {
 				msg = "no free ports";
-			else
+				conn->err_code = CO_ER_FREE_PORTS;
+			}
+			else {
 				msg = "local address already in use";
+				conn->err_code = CO_ER_ADDR_INUSE;
+			}
 
 			qfprintf(stderr,"Connect() failed for backend %s: %s.\n", be->id, msg);
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
 			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s.\n", be->id, msg);
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_RESOURCE;
 		} else if (errno == ETIMEDOUT) {
 			//qfprintf(stderr,"Connect(): ETIMEDOUT");
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
+			conn->err_code = CO_ER_SOCK_ERR;
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_SRVTO;
 		} else {
 			// (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EACCES || errno == EPERM)
@@ -463,11 +500,12 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 			port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 			fdinfo[fd].port_range = NULL;
 			close(fd);
+			conn->err_code = CO_ER_SOCK_ERR;
+			conn->flags |= CO_FL_ERROR;
 			return SN_ERR_SRVCL;
 		}
 	}
 
-	conn->flags  = CO_FL_WAIT_L4_CONN; /* connection in progress */
 	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	/* Prepare to send a few handshakes related to the on-wire protocol. */
@@ -480,6 +518,7 @@ int tcp_connect_server(struct connection *conn, int data, int delack)
 
 	if (conn_xprt_init(conn) < 0) {
 		conn_force_close(conn);
+		conn->flags |= CO_FL_ERROR;
 		return SN_ERR_RESOURCE;
 	}
 
@@ -525,9 +564,9 @@ int tcp_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 }
 
 /* Tries to drain any pending incoming data from the socket to reach the
- * receive shutdown. Returns non-zero if the shutdown was found, otherwise
- * zero. This is useful to decide whether we can close a connection cleanly
- * are we must kill it hard.
+ * receive shutdown. Returns positive if the shutdown was found, negative
+ * if EAGAIN was hit, otherwise zero. This is useful to decide whether we
+ * can close a connection cleanly are we must kill it hard.
  */
 int tcp_drain(int fd)
 {
@@ -541,15 +580,22 @@ int tcp_drain(int fd)
 #endif
 			len = recv(fd, trash.str, trash.size, MSG_DONTWAIT | MSG_NOSIGNAL);
 
-		if (len == 0)                /* cool, shutdown received */
+		if (len == 0) {
+			/* cool, shutdown received */
+			fdtab[fd].linger_risk = 0;
 			return 1;
+		}
 
 		if (len < 0) {
-			if (errno == EAGAIN) /* connection not closed yet */
-				return 0;
+			if (errno == EAGAIN) {
+				/* connection not closed yet */
+				fd_cant_recv(fd);
+				return -1;
+			}
 			if (errno == EINTR)  /* oops, try again */
 				continue;
 			/* other errors indicate a dead connection, fine. */
+			fdtab[fd].linger_risk = 0;
 			return 1;
 		}
 		/* OK we read some data, let's try again once */
@@ -583,11 +629,14 @@ int tcp_connect_probe(struct connection *conn)
 	if (conn->flags & CO_FL_ERROR)
 		return 0;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
 		return 0;
 
 	if (!(conn->flags & CO_FL_WAIT_L4_CONN))
 		return 1; /* strange we were called while ready */
+
+	if (!fd_send_ready(fd))
+		return 0;
 
 	/* we might be the first witness of FD_POLL_ERR. Note that FD_POLL_HUP
 	 * without FD_POLL_IN also indicates a hangup without input data meaning
@@ -614,7 +663,7 @@ int tcp_connect_probe(struct connection *conn)
 	if (connect(fd, (struct sockaddr *)&conn->addr.to, get_addr_len(&conn->addr.to)) < 0) {
 		if (errno == EALREADY || errno == EINPROGRESS) {
 			__conn_sock_stop_recv(conn);
-			__conn_sock_poll_send(conn);
+			fd_cant_send(fd);
 			return 0;
 		}
 
@@ -635,7 +684,7 @@ int tcp_connect_probe(struct connection *conn)
 	/* Write error on the file descriptor. Report it to the connection
 	 * and disable polling on this FD.
 	 */
-
+	fdtab[fd].linger_risk = 0;
 	conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
 	__conn_sock_stop_both(conn);
 	return 0;
@@ -740,6 +789,9 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 			if (1
 #if defined(IPV6_TRANSPARENT)
 			    && (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) == -1)
+#endif
+#if defined(IP_FREEBIND)
+			    && (setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one)) == -1)
 #endif
 #if defined(IPV6_BINDANY)
 			    && (setsockopt(fd, IPPROTO_IPV6, IPV6_BINDANY, &one, sizeof(one)) == -1)
@@ -975,7 +1027,7 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 				 */
 				struct stktable_key *key;
 
-				if (s->stkctr[tcp_trk_idx(rule->action)].entry)
+				if (stkctr_entry(&s->stkctr[tcp_trk_idx(rule->action)]))
 					continue;
 
 				t = rule->act_prm.trk_ctr.table.t;
@@ -983,8 +1035,9 @@ int tcp_inspect_request(struct session *s, struct channel *req, int an_bit)
 
 				if (key && (ts = stktable_get_entry(t, key))) {
 					session_track_stkctr(&s->stkctr[tcp_trk_idx(rule->action)], t, ts);
+					stkctr_set_flags(&s->stkctr[tcp_trk_idx(rule->action)], STKCTR_TRACK_CONTENT);
 					if (s->fe != s->be)
-						s->flags |= SN_BE_TRACK_SC0 << tcp_trk_idx(rule->action);
+						stkctr_set_flags(&s->stkctr[tcp_trk_idx(rule->action)], STKCTR_TRACK_BACKEND);
 				}
 			}
 			else {
@@ -1141,7 +1194,7 @@ int tcp_exec_req_rules(struct session *s)
 				 */
 				struct stktable_key *key;
 
-				if (s->stkctr[tcp_trk_idx(rule->action)].entry)
+				if (stkctr_entry(&s->stkctr[tcp_trk_idx(rule->action)]))
 					continue;
 
 				t = rule->act_prm.trk_ctr.table.t;
@@ -1165,9 +1218,10 @@ int tcp_exec_req_rules(struct session *s)
 
 /* Parse a tcp-response rule. Return a negative value in case of failure */
 static int tcp_parse_response_rule(char **args, int arg, int section_type,
-				  struct proxy *curpx, struct proxy *defpx,
-				  struct tcp_rule *rule, char **err,
-                                  unsigned int where)
+                                   struct proxy *curpx, struct proxy *defpx,
+                                   struct tcp_rule *rule, char **err,
+                                   unsigned int where,
+                                   const char *file, int line)
 {
 	if (curpx == defpx || !(curpx->cap & PR_CAP_BE)) {
 		memprintf(err, "%s %s is only allowed in 'backend' sections",
@@ -1195,7 +1249,7 @@ static int tcp_parse_response_rule(char **args, int arg, int section_type,
 	}
 
 	if (strcmp(args[arg], "if") == 0 || strcmp(args[arg], "unless") == 0) {
-		if ((rule->cond = build_acl_cond(NULL, 0, curpx, (const char **)args+arg, err)) == NULL) {
+		if ((rule->cond = build_acl_cond(file, line, curpx, (const char **)args+arg, err)) == NULL) {
 			memprintf(err,
 			          "'%s %s %s' : error detected in %s '%s' while parsing '%s' condition : %s",
 			          args[0], args[1], args[2], proxy_type_str(curpx), curpx->id, args[arg], *err);
@@ -1217,7 +1271,7 @@ static int tcp_parse_response_rule(char **args, int arg, int section_type,
 static int tcp_parse_request_rule(char **args, int arg, int section_type,
                                   struct proxy *curpx, struct proxy *defpx,
                                   struct tcp_rule *rule, char **err,
-                                  unsigned int where)
+                                  unsigned int where, const char *file, int line)
 {
 	if (curpx == defpx) {
 		memprintf(err, "%s %s is not allowed in 'defaults' sections",
@@ -1242,7 +1296,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 		arg++;
 
 		curpx->conf.args.ctx = ARGC_TRK;
-		expr = sample_parse_expr(args, &arg, err, &curpx->conf.args);
+		expr = sample_parse_expr(args, &arg, file, line, err, &curpx->conf.args);
 		if (!expr) {
 			memprintf(err,
 			          "'%s %s %s' : %s",
@@ -1304,7 +1358,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 	}
 
 	if (strcmp(args[arg], "if") == 0 || strcmp(args[arg], "unless") == 0) {
-		if ((rule->cond = build_acl_cond(NULL, 0, curpx, (const char **)args+arg, err)) == NULL) {
+		if ((rule->cond = build_acl_cond(file, line, curpx, (const char **)args+arg, err)) == NULL) {
 			memprintf(err,
 			          "'%s %s %s' : error detected in %s '%s' while parsing '%s' condition : %s",
 			          args[0], args[1], args[2], proxy_type_str(curpx), curpx->id, args[arg], *err);
@@ -1380,7 +1434,7 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 		if (curpx->cap & PR_CAP_BE)
 			where |= SMP_VAL_BE_RES_CNT;
 
-		if (tcp_parse_response_rule(args, arg, section_type, curpx, defpx, rule, err, where) < 0)
+		if (tcp_parse_response_rule(args, arg, section_type, curpx, defpx, rule, err, where, file, line) < 0)
 			goto error;
 
 		acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;
@@ -1489,7 +1543,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		if (curpx->cap & PR_CAP_BE)
 			where |= SMP_VAL_BE_REQ_CNT;
 
-		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err, where) < 0)
+		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err, where, file, line) < 0)
 			goto error;
 
 		acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;
@@ -1532,7 +1586,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 		where |= SMP_VAL_FE_CON_ACC;
 
-		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err, where) < 0)
+		if (tcp_parse_request_rule(args, arg, section_type, curpx, defpx, rule, err, where, file, line) < 0)
 			goto error;
 
 		acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;

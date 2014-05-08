@@ -45,6 +45,7 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 
+#include <common/base64.h>
 #include <common/buffer.h>
 #include <common/compat.h>
 #include <common/config.h>
@@ -74,7 +75,12 @@
 #include <proto/ssl_sock.h>
 #include <proto/task.h>
 
+/* Warning, these are bits, not integers! */
 #define SSL_SOCK_ST_FL_VERIFY_DONE  0x00000001
+#define SSL_SOCK_ST_FL_16K_WBFSIZE  0x00000002
+#define SSL_SOCK_SEND_UNLIMITED     0x00000004
+#define SSL_SOCK_RECV_HEARTBEAT     0x00000008
+
 /* bits 0xFFFF0000 are reserved to store verify errors */
 
 /* Verify errors macros */
@@ -86,18 +92,43 @@
 #define SSL_SOCK_ST_TO_CAEDEPTH(s) ((s >> (6+16)) & 15)
 #define SSL_SOCK_ST_TO_CRTERROR(s) ((s >> (4+6+16)) & 63)
 
-static int sslconns = 0;
+/* server and bind verify method, it uses a global value as default */
+enum {
+	SSL_SOCK_VERIFY_DEFAULT  = 0,
+	SSL_SOCK_VERIFY_REQUIRED = 1,
+	SSL_SOCK_VERIFY_OPTIONAL = 2,
+	SSL_SOCK_VERIFY_NONE     = 3,
+};
+
+int sslconns = 0;
+int totalsslconns = 0;
 
 void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 {
 	struct connection *conn = (struct connection *)SSL_get_app_data(ssl);
 	(void)ret; /* shut gcc stupid warning */
+	BIO *write_bio;
 
 	if (where & SSL_CB_HANDSHAKE_START) {
 		/* Disable renegotiation (CVE-2009-3555) */
 		if (conn->flags & CO_FL_CONNECTED) {
 			conn->flags |= CO_FL_ERROR;
 			conn->err_code = CO_ER_SSL_RENEG;
+		}
+	}
+
+	if ((where & SSL_CB_ACCEPT_LOOP) == SSL_CB_ACCEPT_LOOP) {
+		if (!(conn->xprt_st & SSL_SOCK_ST_FL_16K_WBFSIZE)) {
+			/* Long certificate chains optimz
+			   If write and read bios are differents, we
+			   consider that the buffering was activated,
+                           so we rise the output buffer size from 4k
+			   to 16k */
+			write_bio = SSL_get_wbio(ssl);
+			if (write_bio != SSL_get_rbio(ssl)) {
+				BIO_set_write_buffer_size(write_bio, 16384);
+				conn->xprt_st |= SSL_SOCK_ST_FL_16K_WBFSIZE;
+			}
 		}
 	}
 }
@@ -151,6 +182,49 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 	return 0;
 }
 
+/* Callback is called for ssl protocol analyse */
+void ssl_sock_msgcbk(int write_p, int version, int content_type, const void *buf, size_t len, SSL *ssl, void *arg)
+{
+#ifdef TLS1_RT_HEARTBEAT
+	/* test heartbeat received (write_p is set to 0
+	   for a received record) */
+	if ((content_type == TLS1_RT_HEARTBEAT) && (write_p == 0)) {
+		struct connection *conn = (struct connection *)SSL_get_app_data(ssl);
+		const unsigned char *p = buf;
+		unsigned int payload;
+
+		conn->xprt_st |= SSL_SOCK_RECV_HEARTBEAT;
+
+		/* Check if this is a CVE-2014-0160 exploitation attempt. */
+		if (*p != TLS1_HB_REQUEST)
+			return;
+
+		if (len < 1 + 2 + 16) /* 1 type + 2 size + 0 payload + 16 padding */
+			goto kill_it;
+
+		payload = (p[1] * 256) + p[2];
+		if (3 + payload + 16 <= len)
+			return; /* OK no problem */
+	kill_it:
+		/* We have a clear heartbleed attack (CVE-2014-0160), the
+		 * advertised payload is larger than the advertised packet
+		 * length, so we have garbage in the buffer between the
+		 * payload and the end of the buffer (p+len). We can't know
+		 * if the SSL stack is patched, and we don't know if we can
+		 * safely wipe out the area between p+3+len and payload.
+		 * So instead, we prevent the response from being sent by
+		 * setting the max_send_fragment to 0 and we report an SSL
+		 * error, which will kill this connection. It will be reported
+		 * above as SSL_ERROR_SSL while an other handshake failure with
+		 * a heartbeat message will be reported as SSL_ERROR_SYSCALL.
+		 */
+		ssl->max_send_fragment = 0;
+		SSLerr(SSL_F_TLS1_HEARTBEAT, SSL_R_SSL_HANDSHAKE_FAILURE);
+		return;
+	}
+#endif
+}
+
 #ifdef OPENSSL_NPN_NEGOTIATED
 /* This callback is used so that the server advertises the list of
  * negociable protocols for NPN.
@@ -166,17 +240,21 @@ static int ssl_sock_advertise_npn_protos(SSL *s, const unsigned char **data,
 }
 #endif
 
-#ifdef OPENSSL_ALPN_NEGOTIATED
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 /* This callback is used so that the server advertises the list of
  * negociable protocols for ALPN.
  */
-static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **data,
-                                          unsigned int *len, void *arg)
+static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **out,
+                                          unsigned char *outlen,
+                                          const unsigned char *server,
+                                          unsigned int server_len, void *arg)
 {
 	struct bind_conf *conf = arg;
 
-	*data = (const unsigned char *)conf->alpn_str;
-	*len = conf->alpn_len;
+	if (SSL_select_next_proto((unsigned char**) out, outlen, (const unsigned char *)conf->alpn_str,
+	                          conf->alpn_len, server, server_len) != OPENSSL_NPN_NEGOTIATED) {
+		return SSL_TLSEXT_ERR_NOACK;
+	}
 	return SSL_TLSEXT_ERR_OK;
 }
 #endif
@@ -650,6 +728,7 @@ int ssl_sock_load_cert_list_file(char *file, struct bind_conf *bind_conf, struct
 int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy *curproxy)
 {
 	int cfgerr = 0;
+	int verify = SSL_VERIFY_NONE;
 	int ssloptions =
 		SSL_OP_ALL | /* all known workarounds for bugs */
 		SSL_OP_NO_SSLv2 |
@@ -694,8 +773,19 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 
 	SSL_CTX_set_options(ctx, ssloptions);
 	SSL_CTX_set_mode(ctx, sslmode);
-	SSL_CTX_set_verify(ctx, bind_conf->verify ? bind_conf->verify : SSL_VERIFY_NONE, ssl_sock_bind_verifycbk);
-	if (bind_conf->verify & SSL_VERIFY_PEER) {
+	switch (bind_conf->verify) {
+		case SSL_SOCK_VERIFY_NONE:
+			verify = SSL_VERIFY_NONE;
+			break;
+		case SSL_SOCK_VERIFY_OPTIONAL:
+			verify = SSL_VERIFY_PEER;
+			break;
+		case SSL_SOCK_VERIFY_REQUIRED:
+			verify = SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+			break;
+	}
+	SSL_CTX_set_verify(ctx, verify, ssl_sock_bind_verifycbk);
+	if (verify & SSL_VERIFY_PEER) {
 		if (bind_conf->ca_file) {
 			/* load CAfile to verify */
 			if (!SSL_CTX_load_verify_locations(ctx, bind_conf->ca_file, NULL)) {
@@ -705,6 +795,11 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 			}
 			/* set CA names fo client cert request, function returns void */
 			SSL_CTX_set_client_CA_list(ctx, SSL_load_client_CA_file(bind_conf->ca_file));
+		}
+		else {
+			Alert("Proxy '%s': verify is enabled but no CA file specified for bind '%s' at [%s:%d].\n",
+			      curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+			cfgerr++;
 		}
 #ifdef X509_V_FLAG_CRL_CHECK
 		if (bind_conf->crl_file) {
@@ -735,13 +830,15 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 	}
 
 	SSL_CTX_set_info_callback(ctx, ssl_sock_infocbk);
+	SSL_CTX_set_msg_callback(ctx, ssl_sock_msgcbk);
+
 #ifdef OPENSSL_NPN_NEGOTIATED
 	if (bind_conf->npn_str)
 		SSL_CTX_set_next_protos_advertised_cb(ctx, ssl_sock_advertise_npn_protos, bind_conf);
 #endif
-#ifdef OPENSSL_ALPN_NEGOTIATED
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 	if (bind_conf->alpn_str)
-		SSL_CTX_set_alpn_advertised_cb(ctx, ssl_sock_advertise_alpn_protos, bind_conf);
+		SSL_CTX_set_alpn_select_cb(ctx, ssl_sock_advertise_alpn_protos, bind_conf);
 #endif
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
@@ -905,6 +1002,7 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 		SSL_MODE_ENABLE_PARTIAL_WRITE |
 		SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
 		SSL_MODE_RELEASE_BUFFERS;
+	int verify = SSL_VERIFY_NONE;
 
 	/* Make sure openssl opens /dev/urandom before the chroot */
 	if (!ssl_initialize_random()) {
@@ -973,25 +1071,48 @@ int ssl_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 
 	SSL_CTX_set_options(srv->ssl_ctx.ctx, options);
 	SSL_CTX_set_mode(srv->ssl_ctx.ctx, mode);
+
+	if (global.ssl_server_verify == SSL_SERVER_VERIFY_REQUIRED)
+		verify = SSL_VERIFY_PEER;
+
+	switch (srv->ssl_ctx.verify) {
+		case SSL_SOCK_VERIFY_NONE:
+			verify = SSL_VERIFY_NONE;
+			break;
+		case SSL_SOCK_VERIFY_REQUIRED:
+			verify = SSL_VERIFY_PEER;
+			break;
+	}
 	SSL_CTX_set_verify(srv->ssl_ctx.ctx,
-	                   srv->ssl_ctx.verify ? srv->ssl_ctx.verify : SSL_VERIFY_NONE,
+	                   verify,
 	                   srv->ssl_ctx.verify_host ? ssl_sock_srv_verifycbk : NULL);
-	if (srv->ssl_ctx.verify & SSL_VERIFY_PEER) {
+	if (verify & SSL_VERIFY_PEER) {
 		if (srv->ssl_ctx.ca_file) {
 			/* load CAfile to verify */
 			if (!SSL_CTX_load_verify_locations(srv->ssl_ctx.ctx, srv->ssl_ctx.ca_file, NULL)) {
-				Alert("Proxy '%s', server '%s' |%s:%d] unable to load CA file '%s'.\n",
+				Alert("Proxy '%s', server '%s' [%s:%d] unable to load CA file '%s'.\n",
 				      curproxy->id, srv->id,
 				      srv->conf.file, srv->conf.line, srv->ssl_ctx.ca_file);
 				cfgerr++;
 			}
+		}
+		else {
+			if (global.ssl_server_verify == SSL_SERVER_VERIFY_REQUIRED)
+				Alert("Proxy '%s', server '%s' [%s:%d] verify is enabled by default but no CA file specified. If you're running on a LAN where you're certain to trust the server's certificate, please set an explicit 'verify none' statement on the 'server' line, or use 'ssl-server-verify none' in the global section to disable server-side verifications by default.\n",
+				      curproxy->id, srv->id,
+				      srv->conf.file, srv->conf.line);
+			else
+				Alert("Proxy '%s', server '%s' [%s:%d] verify is enabled but no CA file specified.\n",
+				      curproxy->id, srv->id,
+				      srv->conf.file, srv->conf.line);
+			cfgerr++;
 		}
 #ifdef X509_V_FLAG_CRL_CHECK
 		if (srv->ssl_ctx.crl_file) {
 			X509_STORE *store = SSL_CTX_get_cert_store(srv->ssl_ctx.ctx);
 
 			if (!store || !X509_STORE_load_locations(store, srv->ssl_ctx.crl_file, NULL)) {
-				Alert("Proxy '%s', server '%s' |%s:%d] unable to configure CRL file '%s'.\n",
+				Alert("Proxy '%s', server '%s' [%s:%d] unable to configure CRL file '%s'.\n",
 				      curproxy->id, srv->id,
 				      srv->conf.file, srv->conf.line, srv->ssl_ctx.crl_file);
 				cfgerr++;
@@ -1097,7 +1218,7 @@ static int ssl_sock_init(struct connection *conn)
 	if (conn->xprt_ctx)
 		return 0;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
 		return 0;
 
 	if (global.maxsslconn && sslconns >= global.maxsslconn) {
@@ -1129,6 +1250,7 @@ static int ssl_sock_init(struct connection *conn)
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
 		sslconns++;
+		totalsslconns++;
 		return 0;
 	}
 	else if (objt_listener(conn->target)) {
@@ -1151,6 +1273,7 @@ static int ssl_sock_init(struct connection *conn)
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
 		sslconns++;
+		totalsslconns++;
 		return 0;
 	}
 	/* don't know how to handle such a target */
@@ -1169,7 +1292,7 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 {
 	int ret;
 
-	if (!(conn->flags & CO_FL_CTRL_READY))
+	if (!conn_ctrl_ready(conn))
 		return 0;
 
 	if (!conn->xprt_ctx)
@@ -1191,7 +1314,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			if (ret == SSL_ERROR_WANT_WRITE) {
 				/* SSL handshake needs to write, L4 connection may not be ready */
 				__conn_sock_stop_recv(conn);
-				__conn_sock_poll_send(conn);
+				__conn_sock_want_send(conn);
+				fd_cant_send(conn->t.sock.fd);
 				return 0;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -1206,7 +1330,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				if (conn->flags & CO_FL_WAIT_L4_CONN)
 					conn->flags &= ~CO_FL_WAIT_L4_CONN;
 				__conn_sock_stop_send(conn);
-				__conn_sock_poll_recv(conn);
+				__conn_sock_want_recv(conn);
+				fd_cant_recv(conn->t.sock.fd);
 				return 0;
 			}
 			else if (ret == SSL_ERROR_SYSCALL) {
@@ -1214,13 +1339,26 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
 					conn->flags &= ~CO_FL_WAIT_L4_CONN;
 				if (!conn->err_code) {
-					if (!((SSL *)conn->xprt_ctx)->packet_length)
-						if (!errno)
-							conn->err_code = CO_ER_SSL_EMPTY;
+					if (!((SSL *)conn->xprt_ctx)->packet_length) {
+						if (!errno) {
+							if (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT)
+								conn->err_code = CO_ER_SSL_HANDSHAKE_HB;
+							else
+								conn->err_code = CO_ER_SSL_EMPTY;
+						}
+						else {
+							if (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT)
+								conn->err_code = CO_ER_SSL_HANDSHAKE_HB;
+							else
+								conn->err_code = CO_ER_SSL_ABORT;
+						}
+					}
+					else {
+						if (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT)
+							conn->err_code = CO_ER_SSL_HANDSHAKE_HB;
 						else
-							conn->err_code = CO_ER_SSL_ABORT;
-					else
-						conn->err_code = CO_ER_SSL_HANDSHAKE;
+							conn->err_code = CO_ER_SSL_HANDSHAKE;
+					}
 				}
 				goto out_error;
 			}
@@ -1231,10 +1369,10 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				 * TCP sockets. We first try to drain possibly pending
 				 * data to avoid this as much as possible.
 				 */
-				if ((conn->flags & CO_FL_CTRL_READY) && conn->ctrl && conn->ctrl->drain)
-					conn->ctrl->drain(conn->t.sock.fd);
+				conn_drain(conn);
 				if (!conn->err_code)
-					conn->err_code = CO_ER_SSL_HANDSHAKE;
+					conn->err_code = (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT) ?
+						CO_ER_SSL_KILLED_HB : CO_ER_SSL_HANDSHAKE;
 				goto out_error;
 			}
 		}
@@ -1250,7 +1388,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		if (ret == SSL_ERROR_WANT_WRITE) {
 			/* SSL handshake needs to write, L4 connection may not be ready */
 			__conn_sock_stop_recv(conn);
-			__conn_sock_poll_send(conn);
+			__conn_sock_want_send(conn);
+			fd_cant_send(conn->t.sock.fd);
 			return 0;
 		}
 		else if (ret == SSL_ERROR_WANT_READ) {
@@ -1258,7 +1397,8 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			if (conn->flags & CO_FL_WAIT_L4_CONN)
 				conn->flags &= ~CO_FL_WAIT_L4_CONN;
 			__conn_sock_stop_send(conn);
-			__conn_sock_poll_recv(conn);
+			__conn_sock_want_recv(conn);
+			fd_cant_recv(conn->t.sock.fd);
 			return 0;
 		}
 		else if (ret == SSL_ERROR_SYSCALL) {
@@ -1266,13 +1406,26 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
 				conn->flags &= ~CO_FL_WAIT_L4_CONN;
 
-			if (!((SSL *)conn->xprt_ctx)->packet_length)
-				if (!errno)
-					conn->err_code = CO_ER_SSL_EMPTY;
+			if (!((SSL *)conn->xprt_ctx)->packet_length) {
+				if (!errno) {
+					if (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT)
+						conn->err_code = CO_ER_SSL_HANDSHAKE_HB;
+					else
+						conn->err_code = CO_ER_SSL_EMPTY;
+				}
+				else {
+					if (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT)
+						conn->err_code = CO_ER_SSL_HANDSHAKE_HB;
+					else
+						conn->err_code = CO_ER_SSL_ABORT;
+				}
+			}
+			else {
+				if (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT)
+					conn->err_code = CO_ER_SSL_HANDSHAKE_HB;
 				else
-					conn->err_code = CO_ER_SSL_ABORT;
-			else
-				conn->err_code = CO_ER_SSL_HANDSHAKE;
+					conn->err_code = CO_ER_SSL_HANDSHAKE;
+			}
 			goto out_error;
 		}
 		else {
@@ -1282,10 +1435,10 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			 * TCP sockets. We first try to drain possibly pending
 			 * data to avoid this as much as possible.
 			 */
-			if ((conn->flags & CO_FL_CTRL_READY) && conn->ctrl && conn->ctrl->drain)
-				conn->ctrl->drain(conn->t.sock.fd);
+			conn_drain(conn);
 			if (!conn->err_code)
-				conn->err_code = CO_ER_SSL_HANDSHAKE;
+				conn->err_code = (conn->xprt_st & SSL_SOCK_RECV_HEARTBEAT) ?
+					CO_ER_SSL_KILLED_HB : CO_ER_SSL_HANDSHAKE;
 			goto out_error;
 		}
 	}
@@ -1325,8 +1478,7 @@ reneg_ok:
 }
 
 /* Receive up to <count> bytes from connection <conn>'s socket and store them
- * into buffer <buf>. The caller must ensure that <count> is always smaller
- * than the buffer's size. Only one call to recv() is performed, unless the
+ * into buffer <buf>. Only one call to recv() is performed, unless the
  * buffer wraps, in which case a second call may be performed. The connection's
  * flags are updated with whatever special event is detected (error, read0,
  * empty). The caller is responsible for taking care of those events and
@@ -1336,7 +1488,7 @@ reneg_ok:
 static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int count)
 {
 	int ret, done = 0;
-	int try = count;
+	int try;
 
 	if (!conn->xprt_ctx)
 		goto out_error;
@@ -1345,24 +1497,27 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		/* a handshake was requested */
 		return 0;
 
-	/* compute the maximum block size we can read at once. */
-	if (buffer_empty(buf)) {
-		/* let's realign the buffer to optimize I/O */
+	/* let's realign the buffer to optimize I/O */
+	if (buffer_empty(buf))
 		buf->p = buf->data;
-	}
-	else if (buf->data + buf->o < buf->p &&
-		 buf->p + buf->i < buf->data + buf->size) {
-		/* remaining space wraps at the end, with a moving limit */
-		if (try > buf->data + buf->size - (buf->p + buf->i))
-			try = buf->data + buf->size - (buf->p + buf->i);
-	}
 
 	/* read the largest possible block. For this, we perform only one call
 	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
 	 * in which case we accept to do it once again. A new attempt is made on
 	 * EINTR too.
 	 */
-	while (try) {
+	while (count > 0) {
+		/* first check if we have some room after p+i */
+		try = buf->data + buf->size - (buf->p + buf->i);
+		/* otherwise continue between data and p-o */
+		if (try <= 0) {
+			try = buf->p - (buf->data + buf->o);
+			if (try <= 0)
+				break;
+		}
+		if (try > count)
+			try = count;
+
 		ret = SSL_read(conn->xprt_ctx, bi_end(buf), try);
 		if (conn->flags & CO_FL_ERROR) {
 			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
@@ -1374,7 +1529,6 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 			if (ret < try)
 				break;
 			count -= ret;
-			try = count;
 		}
 		else if (ret == 0) {
 			ret =  SSL_get_error(conn->xprt_ctx, ret);
@@ -1405,7 +1559,7 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 					break;
 				}
 				/* we need to poll for retry a read later */
-				__conn_data_poll_recv(conn);
+				fd_cant_recv(conn->t.sock.fd);
 				break;
 			}
 			/* otherwise it's a real error */
@@ -1427,8 +1581,8 @@ static int ssl_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 
 
 /* Send all pending bytes from buffer <buf> to connection <conn>'s socket.
- * <flags> may contain MSG_MORE to make the system hold on without sending
- * data too fast, but this flag is ignored at the moment.
+ * <flags> may contain some CO_SFL_* flags to hint the system about other
+ * pending data for example, but this flag is ignored at the moment.
  * Only one call to send() is performed, unless the buffer wraps, in which case
  * a second call may be performed. The connection's flags are updated with
  * whatever special event is detected (error, empty). The caller is responsible
@@ -1456,15 +1610,28 @@ static int ssl_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 	while (buf->o) {
 		try = bo_contig_data(buf);
 
-		if (global.tune.ssl_max_record && try > global.tune.ssl_max_record)
+		if (!(flags & CO_SFL_STREAMER) &&
+		    !(conn->xprt_st & SSL_SOCK_SEND_UNLIMITED) &&
+		    global.tune.ssl_max_record && try > global.tune.ssl_max_record) {
 			try = global.tune.ssl_max_record;
+		}
+		else {
+			/* we need to keep the information about the fact that
+			 * we're not limiting the upcoming send(), because if it
+			 * fails, we'll have to retry with at least as many data.
+			 */
+			conn->xprt_st |= SSL_SOCK_SEND_UNLIMITED;
+		}
 
 		ret = SSL_write(conn->xprt_ctx, bo_ptr(buf), try);
+
 		if (conn->flags & CO_FL_ERROR) {
 			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
 			goto out_error;
 		}
 		if (ret > 0) {
+			conn->xprt_st &= ~SSL_SOCK_SEND_UNLIMITED;
+
 			buf->o -= ret;
 			done += ret;
 
@@ -1486,7 +1653,7 @@ static int ssl_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 					break;
 				}
 				/* we need to poll to retry a write later */
-				__conn_data_poll_send(conn);
+				fd_cant_send(conn->t.sock.fd);
 				break;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -2101,7 +2268,8 @@ smp_fetch_ssl_c_sig_alg(struct proxy *px, struct session *l4, void *l7, unsigned
 		return 0;
 	}
 
-	smp->type = SMP_T_CSTR;
+	smp->type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
 	smp->data.str.len = strlen(smp->data.str.str);
 	X509_free(crt);
 
@@ -2142,7 +2310,8 @@ smp_fetch_ssl_c_key_alg(struct proxy *px, struct session *l4, void *l7, unsigned
 		return 0;
 	}
 
-	smp->type = SMP_T_CSTR;
+	smp->type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
 	smp->data.str.len = strlen(smp->data.str.str);
 	X509_free(crt);
 
@@ -2351,7 +2520,8 @@ smp_fetch_ssl_f_sig_alg(struct proxy *px, struct session *l4, void *l7, unsigned
 	if (!smp->data.str.str)
 		return 0;
 
-	smp->type = SMP_T_CSTR;
+	smp->type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
 	smp->data.str.len = strlen(smp->data.str.str);
 
 	return 1;
@@ -2388,7 +2558,8 @@ smp_fetch_ssl_f_key_alg(struct proxy *px, struct session *l4, void *l7, unsigned
 	if (!smp->data.str.str)
 		return 0;
 
-	smp->type = SMP_T_CSTR;
+	smp->type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
 	smp->data.str.len = strlen(smp->data.str.str);
 
 	return 1;
@@ -2519,7 +2690,8 @@ smp_fetch_ssl_fc_cipher(struct proxy *px, struct session *l4, void *l7, unsigned
 	if (!smp->data.str.str)
 		return 0;
 
-	smp->type = SMP_T_CSTR;
+	smp->type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
 	smp->data.str.len = strlen(smp->data.str.str);
 
 	return 1;
@@ -2579,8 +2751,8 @@ smp_fetch_ssl_fc_npn(struct proxy *px, struct session *l4, void *l7, unsigned in
 {
 	struct connection *conn;
 
-	smp->flags = 0;
-	smp->type = SMP_T_CSTR;
+	smp->flags = SMP_F_CONST;
+	smp->type = SMP_T_STR;
 
 	if (!l4)
 		return 0;
@@ -2600,15 +2772,15 @@ smp_fetch_ssl_fc_npn(struct proxy *px, struct session *l4, void *l7, unsigned in
 }
 #endif
 
-#ifdef OPENSSL_ALPN_NEGOTIATED
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 static int
 smp_fetch_ssl_fc_alpn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
                       const struct arg *args, struct sample *smp, const char *kw)
 {
 	struct connection *conn;
 
-	smp->flags = 0;
-	smp->type = SMP_T_CSTR;
+	smp->flags = SMP_F_CONST;
+	smp->type = SMP_T_STR;
 
 	if (!l4)
 		return 0;
@@ -2618,7 +2790,7 @@ smp_fetch_ssl_fc_alpn(struct proxy *px, struct session *l4, void *l7, unsigned i
 		return 0;
 
 	smp->data.str.str = NULL;
-	SSL_get0_alpn_negotiated(conn->xprt_ctx,
+	SSL_get0_alpn_selected(conn->xprt_ctx,
 	                         (const unsigned char **)&smp->data.str.str, (unsigned *)&smp->data.str.len);
 
 	if (!smp->data.str.str)
@@ -2647,7 +2819,8 @@ smp_fetch_ssl_fc_protocol(struct proxy *px, struct session *l4, void *l7, unsign
 	if (!smp->data.str.str)
 		return 0;
 
-	smp->type = SMP_T_CSTR;
+	smp->type = SMP_T_STR;
+	smp->flags = SMP_F_CONST;
 	smp->data.str.len = strlen(smp->data.str.str);
 
 	return 1;
@@ -2661,8 +2834,8 @@ smp_fetch_ssl_fc_session_id(struct proxy *px, struct session *l4, void *l7, unsi
 	SSL_SESSION *sess;
 	struct connection *conn;
 
-	smp->flags = 0;
-	smp->type = SMP_T_CBIN;
+	smp->flags = SMP_F_CONST;
+	smp->type = SMP_T_BIN;
 
 	if (!l4)
 		return 0;
@@ -2692,8 +2865,8 @@ smp_fetch_ssl_fc_sni(struct proxy *px, struct session *l4, void *l7, unsigned in
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	struct connection *conn;
 
-	smp->flags = 0;
-	smp->type = SMP_T_CSTR;
+	smp->flags = SMP_F_CONST;
+	smp->type = SMP_T_STR;
 
 	if (!l4)
 		return 0;
@@ -2707,6 +2880,56 @@ smp_fetch_ssl_fc_sni(struct proxy *px, struct session *l4, void *l7, unsigned in
 		return 0;
 
 	smp->data.str.len = strlen(smp->data.str.str);
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+static int
+smp_fetch_ssl_fc_unique_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
+                          const struct arg *args, struct sample *smp, const char *kw)
+{
+#if OPENSSL_VERSION_NUMBER > 0x0090800fL
+	struct connection *conn;
+	int finished_len;
+	int b64_len;
+	struct chunk *finished_trash;
+	struct chunk *smp_trash;
+
+	smp->flags = 0;
+
+	if (!l4)
+	        return 0;
+
+	conn = objt_conn(l4->si[0].end);
+	if (!conn || !conn->xprt_ctx || conn->xprt != &ssl_sock)
+		return 0;
+
+	if (!(conn->flags & CO_FL_CONNECTED)) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	finished_trash = get_trash_chunk();
+	if (!SSL_session_reused(conn->xprt_ctx))
+		finished_len = SSL_get_peer_finished(conn->xprt_ctx, finished_trash->str, finished_trash->size);
+	else
+		finished_len = SSL_get_finished(conn->xprt_ctx, finished_trash->str, finished_trash->size);
+
+	if (!finished_len)
+		return 0;
+
+	smp_trash = get_trash_chunk();
+	b64_len = a2base64(finished_trash->str, finished_len, smp_trash->str, smp_trash->size);
+	if (b64_len < 0)
+		return 0;
+
+	smp->data.str.str = smp_trash->str;
+	smp->type = SMP_T_STR;
+	smp->flags |= SMP_F_CONST;
+	smp->data.str.len = b64_len;
+
 	return 1;
 #else
 	return 0;
@@ -2854,6 +3077,7 @@ static int bind_parse_ciphers(char **args, int cur_arg, struct proxy *px, struct
 static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	char path[MAXPATHLEN];
+
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
@@ -2864,7 +3088,7 @@ static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bin
 			memprintf(err, "'%s' : path too long", args[cur_arg]);
 			return ERR_ALERT | ERR_FATAL;
 		}
-		sprintf(path, "%s/%s",  global.crt_base, args[cur_arg + 1]);
+		snprintf(path, sizeof(path), "%s/%s",  global.crt_base, args[cur_arg + 1]);
 		if (ssl_sock_load_cert(path, conf, px, err) > 0)
 			return ERR_ALERT | ERR_FATAL;
 
@@ -3106,7 +3330,7 @@ static int bind_parse_npn(char **args, int cur_arg, struct proxy *px, struct bin
 /* parse the "alpn" bind keyword */
 static int bind_parse_alpn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-#ifdef OPENSSL_ALPN_NEGOTIATED
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 	char *p1, *p2;
 
 	if (!*args[cur_arg + 1]) {
@@ -3184,11 +3408,11 @@ static int bind_parse_verify(char **args, int cur_arg, struct proxy *px, struct 
 	}
 
 	if (strcmp(args[cur_arg + 1], "none") == 0)
-		conf->verify = SSL_VERIFY_NONE;
+		conf->verify = SSL_SOCK_VERIFY_NONE;
 	else if (strcmp(args[cur_arg + 1], "optional") == 0)
-		conf->verify = SSL_VERIFY_PEER;
+		conf->verify = SSL_SOCK_VERIFY_OPTIONAL;
 	else if (strcmp(args[cur_arg + 1], "required") == 0)
-		conf->verify = SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+		conf->verify = SSL_SOCK_VERIFY_REQUIRED;
 	else {
 		if (err)
 			memprintf(err, "'%s' : unknown verify method '%s', only 'none', 'optional', and 'required' are supported\n",
@@ -3374,9 +3598,9 @@ static int srv_parse_verify(char **args, int *cur_arg, struct proxy *px, struct 
 	}
 
 	if (strcmp(args[*cur_arg + 1], "none") == 0)
-		newsrv->ssl_ctx.verify = SSL_VERIFY_NONE;
+		newsrv->ssl_ctx.verify = SSL_SOCK_VERIFY_NONE;
 	else if (strcmp(args[*cur_arg + 1], "required") == 0)
-		newsrv->ssl_ctx.verify = SSL_VERIFY_PEER;
+		newsrv->ssl_ctx.verify = SSL_SOCK_VERIFY_REQUIRED;
 	else {
 		if (err)
 			memprintf(err, "'%s' : unknown verify method '%s', only 'none' and 'required' are supported\n",
@@ -3429,19 +3653,20 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_f_version",          smp_fetch_ssl_f_version,      0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
 	{ "ssl_fc",                 smp_fetch_ssl_fc,             0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 	{ "ssl_fc_alg_keysize",     smp_fetch_ssl_fc_alg_keysize, 0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
-	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_fc_has_crt",         smp_fetch_ssl_fc_has_crt,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 	{ "ssl_fc_has_sni",         smp_fetch_ssl_fc_has_sni,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 #ifdef OPENSSL_NPN_NEGOTIATED
-	{ "ssl_fc_npn",             smp_fetch_ssl_fc_npn,         0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+	{ "ssl_fc_npn",             smp_fetch_ssl_fc_npn,         0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 #endif
-#ifdef OPENSSL_ALPN_NEGOTIATED
-	{ "ssl_fc_alpn",            smp_fetch_ssl_fc_alpn,        0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+	{ "ssl_fc_alpn",            smp_fetch_ssl_fc_alpn,        0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 #endif
-	{ "ssl_fc_protocol",        smp_fetch_ssl_fc_protocol,    0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+	{ "ssl_fc_protocol",        smp_fetch_ssl_fc_protocol,    0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
+	{ "ssl_fc_unique_id",       smp_fetch_ssl_fc_unique_id,   0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_fc_use_keysize",     smp_fetch_ssl_fc_use_keysize, 0,                   NULL,    SMP_T_UINT, SMP_USE_L5CLI },
-	{ "ssl_fc_session_id",      smp_fetch_ssl_fc_session_id,  0,                   NULL,    SMP_T_CBIN, SMP_USE_L5CLI },
-	{ "ssl_fc_sni",             smp_fetch_ssl_fc_sni,         0,                   NULL,    SMP_T_CSTR, SMP_USE_L5CLI },
+	{ "ssl_fc_session_id",      smp_fetch_ssl_fc_session_id,  0,                   NULL,    SMP_T_BIN,  SMP_USE_L5CLI },
+	{ "ssl_fc_sni",             smp_fetch_ssl_fc_sni,         0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 
@@ -3449,31 +3674,31 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct acl_kw_list acl_kws = {ILH, {
-	{ "ssl_c_i_dn",             NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_c_key_alg",          NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_c_notafter",         NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_c_notbefore",        NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_c_sig_alg",          NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_c_s_dn",             NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_c_serial",           NULL,         pat_parse_bin,     pat_match_bin     },
-	{ "ssl_f_i_dn",             NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_f_key_alg",          NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_f_notafter",         NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_f_notbefore",        NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_f_sig_alg",          NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_f_s_dn",             NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_f_serial",           NULL,         pat_parse_bin,     pat_match_bin     },
-	{ "ssl_fc_cipher",          NULL,         pat_parse_str,     pat_match_str     },
+	{ "ssl_c_i_dn",             NULL,         PAT_MATCH_STR },
+	{ "ssl_c_key_alg",          NULL,         PAT_MATCH_STR },
+	{ "ssl_c_notafter",         NULL,         PAT_MATCH_STR },
+	{ "ssl_c_notbefore",        NULL,         PAT_MATCH_STR },
+	{ "ssl_c_sig_alg",          NULL,         PAT_MATCH_STR },
+	{ "ssl_c_s_dn",             NULL,         PAT_MATCH_STR },
+	{ "ssl_c_serial",           NULL,         PAT_MATCH_BIN },
+	{ "ssl_f_i_dn",             NULL,         PAT_MATCH_STR },
+	{ "ssl_f_key_alg",          NULL,         PAT_MATCH_STR },
+	{ "ssl_f_notafter",         NULL,         PAT_MATCH_STR },
+	{ "ssl_f_notbefore",        NULL,         PAT_MATCH_STR },
+	{ "ssl_f_sig_alg",          NULL,         PAT_MATCH_STR },
+	{ "ssl_f_s_dn",             NULL,         PAT_MATCH_STR },
+	{ "ssl_f_serial",           NULL,         PAT_MATCH_BIN },
+	{ "ssl_fc_cipher",          NULL,         PAT_MATCH_STR },
 #ifdef OPENSSL_NPN_NEGOTIATED
-	{ "ssl_fc_npn",             NULL,         pat_parse_str,     pat_match_str     },
+	{ "ssl_fc_npn",             NULL,         PAT_MATCH_STR },
 #endif
-#ifdef OPENSSL_ALPN_NEGOTIATED
-	{ "ssl_fc_alpn",            NULL,         pat_parse_str,     pat_match_str     },
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+	{ "ssl_fc_alpn",            NULL,         PAT_MATCH_STR },
 #endif
-	{ "ssl_fc_protocol",        NULL,         pat_parse_str,     pat_match_str     },
-	{ "ssl_fc_sni",             "ssl_fc_sni", pat_parse_str,     pat_match_str     },
-	{ "ssl_fc_sni_end",         "ssl_fc_sni", pat_parse_str,     pat_match_end     },
-	{ "ssl_fc_sni_reg",         "ssl_fc_sni", pat_parse_reg,     pat_match_reg     },
+	{ "ssl_fc_protocol",        NULL,         PAT_MATCH_STR },
+	{ "ssl_fc_sni",             "ssl_fc_sni", PAT_MATCH_STR },
+	{ "ssl_fc_sni_end",         "ssl_fc_sni", PAT_MATCH_END },
+	{ "ssl_fc_sni_reg",         "ssl_fc_sni", PAT_MATCH_REG },
 	{ /* END */ },
 }};
 
@@ -3554,6 +3779,17 @@ __attribute__((constructor))
 static void __ssl_sock_init(void)
 {
 	STACK_OF(SSL_COMP)* cm;
+
+#ifdef LISTEN_DEFAULT_CIPHERS
+	global.listen_default_ciphers = LISTEN_DEFAULT_CIPHERS;
+#endif
+#ifdef CONNECT_DEFAULT_CIPHERS
+	global.connect_default_ciphers = CONNECT_DEFAULT_CIPHERS;
+#endif
+	if (global.listen_default_ciphers)
+		global.listen_default_ciphers = strdup(global.listen_default_ciphers);
+	if (global.connect_default_ciphers)
+		global.connect_default_ciphers = strdup(global.connect_default_ciphers);
 
 	SSL_library_init();
 	cm = SSL_COMP_get_compression_methods();

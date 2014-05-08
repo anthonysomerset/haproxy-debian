@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2013  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2014  Willy Tarreau <w@1wt.eu>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -89,6 +89,7 @@
 #include <proto/hdr_idx.h>
 #include <proto/listener.h>
 #include <proto/log.h>
+#include <proto/pattern.h>
 #include <proto/protocol.h>
 #include <proto/proto_http.h>
 #include <proto/proxy.h>
@@ -128,6 +129,7 @@ struct global global = {
 	.maxzlibmem = 0,
 #endif
 	.comp_rate_lim = 0,
+	.ssl_server_verify = SSL_SERVER_VERIFY_REQUIRED,
 	.unix_bind = {
 		 .ux = {
 			 .uid = -1,
@@ -141,24 +143,24 @@ struct global global = {
 		.chksize = BUFSIZE,
 #ifdef USE_OPENSSL
 		.sslcachesize = SSLCACHESIZE,
+#ifdef DEFAULT_SSL_MAX_RECORD
+		.ssl_max_record = DEFAULT_SSL_MAX_RECORD,
+#endif
 #endif
 #ifdef USE_ZLIB
 		.zlibmemlevel = 8,
 		.zlibwindowsize = MAX_WBITS,
 #endif
 		.comp_maxlevel = 1,
-
-
+#ifdef DEFAULT_IDLE_TIMER
+		.idle_timer = DEFAULT_IDLE_TIMER,
+#else
+		.idle_timer = 1000, /* 1 second */
+#endif
 	},
 #ifdef USE_OPENSSL
 #ifdef DEFAULT_MAXSSLCONN
 	.maxsslconn = DEFAULT_MAXSSLCONN,
-#endif
-#ifdef LISTEN_DEFAULT_CIPHERS
-	.listen_default_ciphers = LISTEN_DEFAULT_CIPHERS,
-#endif
-#ifdef CONNECT_DEFAULT_CIPHERS
-	.connect_default_ciphers = CONNECT_DEFAULT_CIPHERS,
 #endif
 #endif
 	/* others NULL OK */
@@ -210,7 +212,7 @@ static struct task *manage_global_listener_queue(struct task *t);
 void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2013 Willy Tarreau <w@1wt.eu>\n\n");
+	printf("Copyright 2000-2014 Willy Tarreau <w@1wt.eu>\n\n");
 }
 
 void display_build_opts()
@@ -383,6 +385,10 @@ void usage(char *name)
 #if defined(CONFIG_HAP_LINUX_SPLICE)
 		"        -dS disables splice usage (broken on old kernels)\n"
 #endif
+#if defined(USE_GETADDRINFO)
+		"        -dG disables getaddrinfo() usage\n"
+#endif
+		"        -dV disables SSL verify on servers side\n"
 		"        -sf/-st [pid ]* finishes/terminates old pids. Must be last arguments.\n"
 		"\n",
 		name, DEFAULT_MAXCONN, cfg_maxpconn);
@@ -521,6 +527,8 @@ void init(int argc, char **argv)
 	tv_update_date(-1,-1);
 	start_date = now;
 
+	srandom(now_ms - getpid());
+
 	/* Get the numeric timezone. */
 	get_localtime(start_date.tv_sec, &curtime);
 	strftime(localtimezone, 6, "%z", &curtime);
@@ -547,6 +555,9 @@ void init(int argc, char **argv)
 #endif
 #if defined(CONFIG_HAP_LINUX_SPLICE)
 	global.tune.options |= GTUNE_USE_SPLICE;
+#endif
+#if defined(USE_GETADDRINFO)
+	global.tune.options |= GTUNE_USE_GAI;
 #endif
 
 	pid = getpid();
@@ -587,6 +598,12 @@ void init(int argc, char **argv)
 			else if (*flag == 'd' && flag[1] == 'S')
 				global.tune.options &= ~GTUNE_USE_SPLICE;
 #endif
+#if defined(USE_GETADDRINFO)
+			else if (*flag == 'd' && flag[1] == 'G')
+				global.tune.options &= ~GTUNE_USE_GAI;
+#endif
+			else if (*flag == 'd' && flag[1] == 'V')
+				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
 			else if (*flag == 'V')
 				arg_mode |= MODE_VERBOSE;
 			else if (*flag == 'd' && flag[1] == 'b')
@@ -686,6 +703,8 @@ void init(int argc, char **argv)
 		if (err_code & ERR_ABORT)
 			exit(1);
 	}
+
+	pattern_finalize_config();
 
 	err_code |= check_config_validity();
 	if (err_code & (ERR_ABORT|ERR_FATAL)) {
@@ -1066,8 +1085,10 @@ void deinit(void)
 
 		list_for_each_entry_safe(rule, ruleb, &p->switching_rules, list) {
 			LIST_DEL(&rule->list);
-			prune_acl_cond(rule->cond);
-			free(rule->cond);
+			if (rule->cond) {
+				prune_acl_cond(rule->cond);
+				free(rule->cond);
+			}
 			free(rule);
 		}
 
@@ -1283,7 +1304,7 @@ void run_poll_loop()
 
 		/* The poller will ensure it returns around <next> */
 		cur_poller.poll(&cur_poller, next);
-		fd_process_spec_events();
+		fd_process_cached_events();
 	}
 }
 

@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <common/chunk.h>
 #include <common/config.h>
 #include <eb32tree.h>
 
@@ -40,6 +41,9 @@
 #ifndef ULLONG_MAX
 # define ULLONG_MAX	(LLONG_MAX * 2ULL + 1)
 #endif
+
+/* size used for max length of decimal representation of long long int. */
+#define NB_LLMAX_STR (sizeof("-9223372036854775807")-1)
 
 /* number of itoa_str entries */
 #define NB_ITOA_STR	10
@@ -62,6 +66,17 @@ enum {
 	STD_OP_LE = 0, STD_OP_GT = 1,
 	STD_OP_EQ = 2, STD_OP_NE = 3,
 	STD_OP_GE = 4, STD_OP_LT = 5,
+};
+
+enum http_scheme {
+	SCH_HTTP,
+	SCH_HTTPS,
+};
+
+struct split_url {
+	enum http_scheme scheme;
+	const char *host;
+	int host_len;
 };
 
 extern int itoa_idx; /* index of next itoa_str to use */
@@ -233,13 +248,18 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
  */
 int str2mask(const char *str, struct in_addr *mask);
 
+/* convert <cidr> to struct in_addr <mask>. It returns 1 if the conversion
+ * succeeds otherwise non-zero.
+ */
+int cidr2dotted(int cidr, struct in_addr *mask);
+
 /*
  * converts <str> to two struct in_addr* which must be pre-allocated.
  * The format is "addr[/mask]", where "addr" cannot be empty, and mask
  * is optionnal and either in the dotted or CIDR notation.
  * Note: "addr" can also be a hostname. Returns 1 if OK, 0 if error.
  */
-int str2net(const char *str, struct in_addr *addr, struct in_addr *mask);
+int str2net(const char *str, int resolve, struct in_addr *addr, struct in_addr *mask);
 
 /*
  * converts <str> to two struct in6_addr* which must be pre-allocated.
@@ -257,7 +277,7 @@ int url2ipv4(const char *addr, struct in_addr *dst);
 /*
  * Resolve destination server from URL. Convert <str> to a sockaddr_storage*.
  */
-int url2sa(const char *url, int ulen, struct sockaddr_storage *addr);
+int url2sa(const char *url, int ulen, struct sockaddr_storage *addr, struct split_url *out);
 
 /* Tries to convert a sockaddr_storage address to text form. Upon success, the
  * address family is returned so that it's easy for the caller to adapt to the
@@ -281,6 +301,14 @@ extern const char hextab[];
 char *encode_string(char *start, char *stop,
 		    const char escape, const fd_set *map,
 		    const char *string);
+
+/*
+ * Same behavior, except that it encodes chunk <chunk> instead of a string.
+ */
+char *encode_chunk(char *start, char *stop,
+                   const char escape, const fd_set *map,
+                   const struct chunk *chunk);
+
 
 /* Decode an URL-encoded string in-place. The resulting string might
  * be shorter. If some forbidden characters are found, the conversion is
@@ -379,6 +407,7 @@ extern unsigned int strl2uic(const char *s, int len);
 extern int strl2ic(const char *s, int len);
 extern int strl2irc(const char *s, int len, int *ret);
 extern int strl2llrc(const char *s, int len, long long *ret);
+extern int strl2llrc_dotted(const char *text, int len, long long *ret);
 extern unsigned int read_uint(const char **s, const char *end);
 unsigned int inetaddr_host(const char *text);
 unsigned int inetaddr_host_lim(const char *text, const char *stop);
@@ -775,5 +804,55 @@ static inline void shut_your_big_mouth_gcc(int r)
 
 /* same as strstr() but case-insensitive */
 const char *strnistr(const char *str1, int len_str1, const char *str2, int len_str2);
+
+
+/************************* Composite address manipulation *********************
+ * Composite addresses are simply unsigned long data in which the higher bits
+ * represent a pointer, and the two lower bits are flags. There are several
+ * places where we just want to associate one or two flags to a pointer (eg,
+ * to type it), and these functions permit this. The pointer is necessarily a
+ * 32-bit aligned pointer, as its two lower bits will be cleared and replaced
+ * with the flags.
+ *****************************************************************************/
+
+/* Masks the two lower bits of a composite address and converts it to a
+ * pointer. This is used to mix some bits with some aligned pointers to
+ * structs and to retrieve the original (32-bit aligned) pointer.
+ */
+static inline void *caddr_to_ptr(unsigned long caddr)
+{
+	return (void *)(caddr & ~3UL);
+}
+
+/* Only retrieves the two lower bits of a composite address. This is used to mix
+ * some bits with some aligned pointers to structs and to retrieve the original
+ * data (2 bits).
+ */
+static inline unsigned int caddr_to_data(unsigned long caddr)
+{
+	return (caddr & 3UL);
+}
+
+/* Combines the aligned pointer whose 2 lower bits will be masked with the bits
+ * from <data> to form a composite address. This is used to mix some bits with
+ * some aligned pointers to structs and to retrieve the original (32-bit aligned)
+ * pointer.
+ */
+static inline unsigned long caddr_from_ptr(void *ptr, unsigned int data)
+{
+	return (((unsigned long)ptr) & ~3UL) + (data & 3);
+}
+
+/* sets the 2 bits of <data> in the <caddr> composite address */
+static inline unsigned long caddr_set_flags(unsigned long caddr, unsigned int data)
+{
+	return caddr | (data & 3);
+}
+
+/* clears the 2 bits of <data> in the <caddr> composite address */
+static inline unsigned long caddr_clr_flags(unsigned long caddr, unsigned int data)
+{
+	return caddr & ~(unsigned long)(data & 3);
+}
 
 #endif /* _COMMON_STANDARD_H */

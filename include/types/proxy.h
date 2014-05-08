@@ -35,6 +35,7 @@
 #include <common/sessionhash.h>
 #include <common/tools.h>
 #include <eb32tree.h>
+#include <ebistree.h>
 
 #include <types/acl.h>
 #include <types/backend.h>
@@ -79,7 +80,7 @@ enum pr_mode {
 /* unused: 0x04, 0x08, 0x10 */
 #define PR_O_PREF_LAST  0x00000020      /* prefer last server */
 #define PR_O_DISPATCH   0x00000040      /* use dispatch mode */
-#define PR_O_KEEPALIVE  0x00000080      /* follow keep-alive sessions */
+/* unused: 0x00000080 */
 #define PR_O_FWDFOR     0x00000100      /* conditionally insert x-forwarded-for with client address */
 /* unused: 0x00000200 */
 #define PR_O_NULLNOLOG  0x00000400      /* a connect without request will not be logged */
@@ -87,17 +88,24 @@ enum pr_mode {
 #define PR_O_FF_ALWAYS  0x00002000      /* always set x-forwarded-for */
 #define PR_O_PERSIST    0x00004000      /* server persistence stays effective even when server is down */
 #define PR_O_LOGASAP    0x00008000      /* log as soon as possible, without waiting for the session to complete */
-#define PR_O_HTTP_CLOSE 0x00010000      /* force 'connection: close' in both directions */
+/* unused: 0x00010000 */
 #define PR_O_CHK_CACHE  0x00020000      /* require examination of cacheability of the 'set-cookie' field */
 #define PR_O_TCP_CLI_KA 0x00040000      /* enable TCP keep-alive on client-side sessions */
 #define PR_O_TCP_SRV_KA 0x00080000      /* enable TCP keep-alive on server-side sessions */
 #define PR_O_USE_ALL_BK 0x00100000      /* load-balance between backup servers */
-#define PR_O_FORCE_CLO  0x00200000      /* enforce the connection close immediately after server response */
+/* unused: 0x00020000 */
 #define PR_O_TCP_NOLING 0x00400000      /* disable lingering on client and server connections */
 #define PR_O_ABRT_CLOSE 0x00800000      /* immediately abort request when client closes */
 
-/* unused: 0x01000000, 0x02000000, 0x04000000 */
-#define PR_O_SERVER_CLO 0x08000000	/* option http-server-close */
+/* unused: 0x01000000, 0x02000000, 0x04000000, 0x08000000 */
+#define PR_O_HTTP_KAL   0x00000000      /* HTTP keep-alive mode (http-keep-alive) */
+#define PR_O_HTTP_PCL   0x01000000      /* HTTP passive close mode (httpclose) = tunnel with Connection: close */
+#define PR_O_HTTP_FCL   0x02000000      /* HTTP forced close mode (forceclose) */
+#define PR_O_HTTP_SCL   0x03000000      /* HTTP server close mode (http-server-close) */
+#define PR_O_HTTP_TUN   0x04000000      /* HTTP tunnel mode : no analysis past first request/response */
+/* unassigned values : 0x05000000, 0x06000000, 0x07000000 */
+#define PR_O_HTTP_MODE  0x07000000      /* MASK to retrieve the HTTP mode */
+#define PR_O_TCPCHK_SSL 0x08000000	/* at least one TCPCHECK connect rule requires SSL */
 #define PR_O_CONTSTATS	0x10000000	/* continous counters */
 #define PR_O_HTTP_PROXY 0x20000000	/* Enable session to use HTTP proxy operations */
 #define PR_O_DISABLE404 0x40000000      /* Disable a server on a 404 response to a health-check */
@@ -248,7 +256,6 @@ struct proxy {
 	int  rdp_cookie_len;			/* strlen(rdp_cookie_name), computed only once */
 	char *url_param_name;			/* name of the URL parameter used for hashing */
 	int  url_param_len;			/* strlen(url_param_name), computed only once */
-	unsigned url_param_post_limit;		/* if checking POST body for URI parameter, max body to wait for */
 	int  uri_len_limit;			/* character limit for uri balancing algorithm */
 	int  uri_dirs_depth1;			/* directories+1 (slashes) limit for uri balancing algorithm */
 	int  uri_whole;				/* if != 0, calculates the hash from the whole uri. Still honors the len_limit and dirs_depth1 */
@@ -282,6 +289,7 @@ struct proxy {
 	struct list pendconns;			/* pending connections with no server assigned yet */
 	int nbpend;				/* number of pending connections with no server assigned yet */
 	int totpend;				/* total number of pending connections on this instance (for stats) */
+	int max_ka_queue;			/* 1+maximum requests in queue accepted for reusing a K-A conn (0=none) */
 	unsigned int feconn, beconn;		/* # of active frontend and backends sessions */
 	struct freq_ctr fe_req_per_sec;		/* HTTP requests per second on the frontend */
 	struct freq_ctr fe_conn_per_sec;	/* received connections per second on the frontend */
@@ -356,6 +364,7 @@ struct proxy {
 		struct list bind;		/* list of bind settings */
 		struct list listeners;		/* list of listeners belonging to this frontend */
 		struct arg_list args;           /* sample arg list that need to be resolved */
+		struct ebpt_node by_name;       /* proxies are stored sorted by name here */
 		char *logformat_string;		/* log format string */
 		char *lfs_file;                 /* file name where the logformat string appears (strdup) */
 		int   lfs_line;                 /* file name where the logformat string appears */
@@ -370,9 +379,11 @@ struct proxy {
 struct switching_rule {
 	struct list list;			/* list linked to from the proxy */
 	struct acl_cond *cond;			/* acl condition to meet */
+	int dynamic;				/* this is a dynamic rule using the logformat expression */
 	union {
 		struct proxy *backend;		/* target backend */
 		char *name;			/* target backend name during config parsing */
+		struct list expr;		/* logformat expression to use for dynamic rules */
 	} be;
 };
 
@@ -415,10 +426,6 @@ struct redirect_rule {
 	int cookie_len;
 	char *cookie_str;
 };
-
-extern struct proxy *proxy;
-extern struct eb_root used_proxy_id;	/* list of proxy IDs in use */
-extern unsigned int error_snapshot_id;  /* global ID assigned to each error then incremented */
 
 #endif /* _TYPES_PROXY_H */
 

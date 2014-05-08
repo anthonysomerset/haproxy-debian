@@ -69,13 +69,13 @@
 
 /* indicate how we *want* the connection to behave, regardless of what is in
  * the headers. We have 4 possible values right now :
- * - WANT_TUN : will be a tunnel (default when nothing configured or with CONNECT).
- * - WANT_KAL : try to maintain keep-alive
+ * - WANT_KAL : try to maintain keep-alive (default hwen nothing configured)
+ * - WANT_TUN : will be a tunnel (CONNECT).
  * - WANT_SCL : enforce close on the server side
  * - WANT_CLO : enforce close on both sides
  */
-#define TX_CON_WANT_TUN 0x00000000	/* note: it's important that it is 0 (init) */
-#define TX_CON_WANT_KAL 0x00100000
+#define TX_CON_WANT_KAL 0x00000000	/* note: it's important that it is 0 (init) */
+#define TX_CON_WANT_TUN 0x00100000
 #define TX_CON_WANT_SCL 0x00200000
 #define TX_CON_WANT_CLO 0x00300000
 #define TX_CON_WANT_MSK 0x00300000	/* this is the mask to get the bits */
@@ -83,7 +83,7 @@
 #define TX_CON_CLO_SET  0x00400000	/* "connection: close" is now set */
 #define TX_CON_KAL_SET  0x00800000	/* "connection: keep-alive" is now set */
 
-/* Unused: 0x1000000 */
+#define TX_PREFER_LAST  0x01000000      /* try to stay on same server if possible (eg: after 401) */
 
 #define TX_HDR_CONN_UPG 0x02000000	/* The "Upgrade" token was found in the "Connection" header */
 #define TX_WAIT_NEXT_RQ	0x04000000	/* waiting for the second request to start, use keep-alive timeout */
@@ -187,6 +187,11 @@ enum ht_state {
 #define HTTP_MSGF_XFER_LEN    0x00000004  /* message xfer size can be determined */
 #define HTTP_MSGF_VER_11      0x00000008  /* the message is HTTP/1.1 or above */
 
+/* If this flag is set, we don't process the body until the connect() is confirmed.
+ * This is only used by the request forwarding function to protect the buffer
+ * contents if something needs them during a redispatch.
+ */
+#define HTTP_MSGF_WAIT_CONN   0x00000010  /* Wait for connect() to be confirmed before processing body */
 
 
 /* Redirect flags */
@@ -222,7 +227,7 @@ enum http_meth_t {
 	HTTP_METH_DELETE,
 	HTTP_METH_TRACE,
 	HTTP_METH_CONNECT,
-	HTTP_METH_OTHER,
+	HTTP_METH_OTHER, /* Must be the last entry */
 } __attribute__((packed));
 
 enum ht_auth_m {
@@ -241,11 +246,18 @@ enum {
 	HTTP_REQ_ACT_AUTH,
 	HTTP_REQ_ACT_ADD_HDR,
 	HTTP_REQ_ACT_SET_HDR,
+	HTTP_REQ_ACT_DEL_HDR,
 	HTTP_REQ_ACT_REDIR,
 	HTTP_REQ_ACT_SET_NICE,
 	HTTP_REQ_ACT_SET_LOGL,
 	HTTP_REQ_ACT_SET_TOS,
 	HTTP_REQ_ACT_SET_MARK,
+	HTTP_REQ_ACT_ADD_ACL,
+	HTTP_REQ_ACT_DEL_ACL,
+	HTTP_REQ_ACT_DEL_MAP,
+	HTTP_REQ_ACT_SET_MAP,
+	HTTP_REQ_ACT_CUSTOM_STOP,
+	HTTP_REQ_ACT_CUSTOM_CONT,
 	HTTP_REQ_ACT_MAX /* must always be last */
 };
 
@@ -256,10 +268,17 @@ enum {
 	HTTP_RES_ACT_DENY,
 	HTTP_RES_ACT_ADD_HDR,
 	HTTP_RES_ACT_SET_HDR,
+	HTTP_RES_ACT_DEL_HDR,
 	HTTP_RES_ACT_SET_NICE,
 	HTTP_RES_ACT_SET_LOGL,
 	HTTP_RES_ACT_SET_TOS,
 	HTTP_RES_ACT_SET_MARK,
+	HTTP_RES_ACT_ADD_ACL,
+	HTTP_RES_ACT_DEL_ACL,
+	HTTP_RES_ACT_DEL_MAP,
+	HTTP_RES_ACT_SET_MAP,
+	HTTP_RES_ACT_CUSTOM_STOP,  /* used for module keywords */
+	HTTP_RES_ACT_CUSTOM_CONT,  /* used for module keywords */
 	HTTP_RES_ACT_MAX /* must always be last */
 };
 
@@ -313,11 +332,30 @@ enum {
  *                             for states after START. When in HTTP_MSG_BODY,
  *                             eoh points to the first byte of the last CRLF
  *                             preceeding data. Relative to buffer's origin.
- *  - sov                    : When in HTTP_MSG_BODY, will point to the first
- *                             byte of data (relative to buffer's origin).
- *  - sol (start of line)    : start of current line during parsing, or zero.
- *  - eol (End of Line)      : relative offset in the buffer of the first byte
- *                             which marks the end of the line (LF or CRLF).
+ *                             This value then remains unchanged till the end
+ *                             so that we can rewind the buffer to change some
+ *                             headers if needed (eg: http-send-name-header).
+ *
+ *  - sov (start of value)   : Before HTTP_MSG_BODY, points to the value of
+ *                             the header being parsed. Starting from
+ *                             HTTP_MSG_BODY, will point to the start of the
+ *                             body (relative to buffer's origin), or to data
+ *                             following a chunk size. Thus <sov> bytes of
+ *                             headers will have to be sent only once.
+ *
+ *  - next (parse pointer)   : next relative byte to be parsed. Always points
+ *                             to a byte matching the current state.
+ *
+ *  - sol (start of line)    : start of current line before MSG_BODY, or zero.
+ *
+ *  - eol (End of Line)      : Before HTTP_MSG_BODY, relative offset in the
+ *                             buffer of the first byte which marks the end of
+ *                             the line current (LF or CRLF).
+ *                             From HTTP_MSG_BODY to the end, contains the
+ *                             length of the last CRLF (1 for a plain LF, or 2
+ *                             for a true CRLF). So eoh+eol always contain the
+ *                             exact size of the header size.
+ *
  * Note that all offsets are relative to the origin of the buffer (buf->p)
  * which always points to the beginning of the message (request or response).
  * Since a message may not wrap, pointer computations may be one without any
@@ -360,10 +398,15 @@ struct http_auth_data {
 	char *user, *pass;                    /* extracted username & password */
 };
 
+struct proxy;
+struct http_txn;
+struct session;
+
 struct http_req_rule {
 	struct list list;
 	struct acl_cond *cond;                 /* acl condition to meet */
 	unsigned int action;                   /* HTTP_REQ_* */
+	int (*action_ptr)(struct http_req_rule *rule, struct proxy *px, struct session *s, struct http_txn *http_txn);  /* ptr to custom action */
 	union {
 		struct {
 			char *realm;
@@ -378,6 +421,11 @@ struct http_req_rule {
 		int loglevel;                  /* log-level value for HTTP_REQ_ACT_SET_LOGL */
 		int tos;                       /* tos value for HTTP_REQ_ACT_SET_TOS */
 		int mark;                      /* nfmark value for HTTP_REQ_ACT_SET_MARK */
+		struct {
+			char *ref;             /* MAP or ACL file name to update */
+			struct list key;       /* pattern to retrieve MAP or ACL key */
+			struct list value;     /* pattern to retrieve MAP value */
+		} map;
 	} arg;                                 /* arguments used by some actions */
 };
 
@@ -385,6 +433,7 @@ struct http_res_rule {
 	struct list list;
 	struct acl_cond *cond;                 /* acl condition to meet */
 	unsigned int action;                   /* HTTP_RES_* */
+	int (*action_ptr)(struct http_res_rule *rule, struct proxy *px, struct session *s, struct http_txn *http_txn);  /* ptr to custom action */
 	union {
 		struct {
 			char *name;            /* header name */
@@ -395,6 +444,11 @@ struct http_res_rule {
 		int loglevel;                  /* log-level value for HTTP_RES_ACT_SET_LOGL */
 		int tos;                       /* tos value for HTTP_RES_ACT_SET_TOS */
 		int mark;                      /* nfmark value for HTTP_RES_ACT_SET_MARK */
+		struct {
+			char *ref;             /* MAP or ACL file name to update */
+			struct list key;       /* pattern to retrieve MAP or ACL key */
+			struct list value;     /* pattern to retrieve MAP value */
+		} map;
 	} arg;                                 /* arguments used by some actions */
 };
 
@@ -420,6 +474,7 @@ struct http_txn {
 	struct http_auth_data auth;	/* HTTP auth data */
 };
 
+
 /* This structure is used by http_find_header() to return values of headers.
  * The header starts at <line>, the value (excluding leading and trailing white
  * spaces) at <line>+<val> for <vlen> bytes, followed by optional <tws> trailing
@@ -436,6 +491,38 @@ struct hdr_ctx {
 	int  del;  /* relative to line */
 	int  prev; /* index of previous header */
 };
+
+struct http_method_name {
+	char *name;
+	int len;
+};
+
+struct http_req_action_kw {
+       const char *kw;
+       int (*parse)(const char **args, int *cur_arg, struct proxy *px, struct http_req_rule *rule, char **err);
+};
+
+struct http_res_action_kw {
+       const char *kw;
+       int (*parse)(const char **args, int *cur_arg, struct proxy *px, struct http_res_rule *rule, char **err);
+};
+
+struct http_req_action_kw_list {
+       const char *scope;
+       struct list list;
+       struct http_req_action_kw kw[VAR_ARRAY];
+};
+
+struct http_res_action_kw_list {
+       const char *scope;
+       struct list list;
+       struct http_res_action_kw kw[VAR_ARRAY];
+};
+
+extern struct http_req_action_kw_list http_req_keywords;
+extern struct http_res_action_kw_list http_res_keywords;
+
+extern const struct http_method_name http_known_methods[HTTP_METH_OTHER];
 
 #endif /* _TYPES_PROTO_HTTP_H */
 
